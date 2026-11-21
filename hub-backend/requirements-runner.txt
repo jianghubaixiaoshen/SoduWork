@@ -5,6 +5,8 @@
 # Avoid installing the full Hub dependency set on Runner machines.
 # Runner uses additional_headers and proxy=None (websockets 15+).
 websockets>=15
+# MIT: native OS certificate trust; 0.10.5 fixes concurrent verification.
+truststore==0.10.5
 # Windows terminals use pywinpty/ConPTY; Linux and macOS use the standard-library pty module.
 # Windows normally uses the packaged soduwork-runner.exe; this file supports Linux installation.
 pywinpty>=3.0; sys_platform == "win32"
@@ -16,11 +18,7 @@ PyYAML>=6.0.3,<7
 pg8000==1.31.5
 PyMySQL[rsa]==1.2.3
 # Apache-2.0 / BSD-3-Clause: RSA authentication and explicit frozen-package notices.
-# 49.0.0 publishes only macosx_11_0_arm64 wheels, so Intel macOS falls back to the sdist and
-# needs a Rust toolchain to build. 48.0.1 still ships macosx_10_9_universal2 wheels; keep the
-# older pin only on Intel macOS so every other platform stays on the current release.
-cryptography==49.0.0; sys_platform != "darwin" or platform_machine != "x86_64"
-cryptography==48.0.1; sys_platform == "darwin" and platform_machine == "x86_64"
+cryptography==50.0.2
 
 # Apache-2.0: official MongoDB driver without dynamic downloads or user-supplied runtimes.
 pymongo==4.18.3

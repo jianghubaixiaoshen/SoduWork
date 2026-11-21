@@ -135,7 +135,7 @@ async function fetchModel(identity, modelName = '', timeoutMs = 8000, fetchImpl 
   }
   if (String(modelName || '').startsWith('local:')) {
     // Local references may only be resolved by a managed runtime in this
-    // desktop process. Account runtimes (Codex/Claude) and cloud execution
+    // desktop process. Account runtimes (Codex) and cloud execution
     // must continue to use their own model or Hub-issued configuration.
     const localAllowed = runtimeSpec?.modelMode === 'managed' &&
       (options.allowLocal === true || requestedAgent === 'pi' && options.app);
@@ -151,17 +151,31 @@ async function fetchModel(identity, modelName = '', timeoutMs = 8000, fetchImpl 
       if (options?.allowHistorical && options.app) return historicalModel(options.app, identity, modelName);
       return { ok: false, reason: '本地模型不存在或凭据未配置，请在「我的模型」中刷新' };
     }
-    const thinking = thinkingCapabilities.profile({ ...local, id: local.name });
+    const config = local.config || {};
+    const thinkingConflict = thinkingCapabilities.conflict({ ...local, ...config, id: local.name });
+    if (thinkingConflict) {
+      if (options.allowHistorical && options.app) return historicalModel(options.app, identity, modelName);
+      return { ok: false, code: 'MODEL_THINKING_CONFLICT', reason: thinkingConflict };
+    }
+    const thinking = thinkingCapabilities.profile({ ...local, ...config, id: local.name });
+    const capabilities = require('../model-capability-contract.cjs').runtimeFields(config, local.capabilityCheck);
+    const incompatible = require('../model-capability-contract.cjs').incompatibility(capabilities, requestedAgent === 'pi' ? ['streaming'] : []);
+    if (incompatible) {
+      if (options.allowHistorical && options.app) return historicalModel(options.app, identity, modelName);
+      return { ok: false, code: 'MODEL_CAPABILITY_INCOMPATIBLE', reason: incompatible };
+    }
     return { ok: true, localOnly: true, model: {
       baseUrl: local.baseUrl, key: local.key, id: local.runtimeId || local.modelRef,
       wireModelId: local.name, label: local.label || local.name,
       provider: local.provider, providerName: local.providerName, authMode: local.authMode,
       keyFrom: 'local', modelRef: local.modelRef,
-      configRevision: local.configRevision,
-      input: ['text'], modality: local.modality || 'chat', maxOutputTokens: local.config?.maxOutputTokens,
+      configRevision: local.configRevision, runtimeRevision: local.runtimeRevision,
+      ...capabilities, modality: local.modality || 'chat',
       ...contextWindow.resolveContextWindow({ contextWindow: local.ctxWindow, modelName: local.name, provider: local.provider }),
       ...thinking,
-      ...(thinking.format ? { thinkingFormat: thinking.format } : {}),
+      ...(['none', 'always', 'controllable'].includes(config.thinkingMode) ? { thinkingMode: config.thinkingMode } : {}),
+      ...(typeof config.thinkingAlwaysOn === 'boolean' ? { thinkingAlwaysOn: config.thinkingAlwaysOn } : {}),
+      ...(config.thinkingFormat || thinking.format ? { thinkingFormat: config.thinkingFormat || thinking.format } : {}),
       localOnly: true, proxyExpiresAt: 0,
     } };
   }
@@ -226,6 +240,11 @@ async function fetchModel(identity, modelName = '', timeoutMs = 8000, fetchImpl 
     if (!d || !d.ok) return { ok: false, reason: custom && d?.reason === '此底座不使用企业模型配置，请检查执行底座'
       ? '后台尚不支持新底座的模型配置，请更新后台后重试' : (d && d.reason) || '后台没给出可用的模型' };
     if (!d.key || !d.model) return { ok: false, reason: '后台回的配置不完整（缺 key 或 model）' };
+    const thinkingConflict = thinkingCapabilities.conflict({ ...d, id: d.model });
+    if (thinkingConflict) {
+      if (options.allowHistorical && options.app) return historicalModel(options.app, identity, modelName);
+      return { ok: false, code: 'MODEL_THINKING_CONFLICT', reason: thinkingConflict };
+    }
     const managed = custom || require('../agent-runtime/runtime-catalog').runtime(requestedAgent)?.modelMode === 'managed';
     if (d.quotaScope === 'personal' && (!managed || d.quotaVersion !== 2 ||
         d.personalQuotaSupported !== true || typeof d.quotaUsageToken !== 'string' || !d.quotaUsageToken ||
@@ -249,6 +268,7 @@ async function fetchModel(identity, modelName = '', timeoutMs = 8000, fetchImpl 
         label: d.label || d.model,
         maxOutputTokens: d.maxOutputTokens,
         capabilityProfile: d.capabilityProfile,
+        compatibility: require('../model-capability-contract.cjs').compatibility(d.compatibility),
         configRevision: d.configRevision,
         runtimeRevision: d.runtimeRevision,
         ...thinkingCapabilities.profile({ id: d.model, providerName: d.providerName,
@@ -281,6 +301,11 @@ async function fetchModel(identity, modelName = '', timeoutMs = 8000, fetchImpl 
         proxyExpiresAt: expiresIn ? issuedAt + expiresIn * 1000 : 0,
       },
     };
+    const incompatible = require('../model-capability-contract.cjs').incompatibility(value.model, requestedAgent === 'pi' ? ['streaming'] : []);
+    if (incompatible) {
+      if (options.allowHistorical && options.app) return historicalModel(options.app, identity, modelName);
+      return { ok: false, code: 'MODEL_CAPABILITY_INCOMPATIBLE', reason: incompatible };
+    }
     const ticketMs = Math.max(1000, expiresIn * 1000 - 5000);
     if (cacheable && generation === configGeneration) {
       _modelCache.set(cacheKey, {
@@ -333,6 +358,7 @@ function writeModels(dir, model) {
         // OpenAI-compatible services may not support these two optional capabilities; disable them by default.
         compat: {
           supportsDeveloperRole: false,
+          ...require('../model-capability-contract.cjs').piCompatibility(model),
           supportsReasoningEffort: Boolean(thinking.supportsReasoningEffort),
           ...(thinking.format ? { thinkingFormat: thinking.format } : {}),
         },

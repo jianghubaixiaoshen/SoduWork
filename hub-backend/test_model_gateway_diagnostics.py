@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import unittest
 
 import httpx
 import uvicorn
@@ -21,6 +22,16 @@ from app.db import get_session
 from app.models import Client, ModelDef, ModelProvider, User
 from app.services import device_auth
 from test_model_runtime import IsolatedDatabase
+
+
+class RequestCorrelationTests(unittest.TestCase):
+    def test_only_bounded_opaque_noncredential_request_ids_are_accepted(self):
+        from app.services.model_transport import _upstream_request_id
+        secret = "synthetic-api-credential"
+        for value in (secret, "prefix-" + secret, "https://private.invalid", "bad\nheader", "x" * 101, ""):
+            self.assertEqual(_upstream_request_id({"x-request-id": value}, secret), "")
+        self.assertEqual(_upstream_request_id({"x-request-id": "request-183:attempt.2"}, secret), "request-183:attempt.2")
+        self.assertEqual(_upstream_request_id({"x-request-id": secret, "x-ms-request-id": "safe-183"}, secret), "safe-183")
 
 
 class GatewayDiagnosticsTests(IsolatedDatabase):
@@ -49,13 +60,18 @@ class GatewayDiagnosticsTests(IsolatedDatabase):
         @upstream.api_route("/{path:path}", methods=["GET", "POST"])
         async def provider(path: str, request: Request):
             self.calls.append((request.method, path))
+            if self.mode in ("trace-denial", "unsafe-trace-denial"):
+                request_id = "fixture-request-183" if self.mode == "trace-denial" else self.secret
+                return JSONResponse(status_code=403, headers={"x-request-id": request_id}, content={
+                    "error": {"message": f"private refusal {self.secret} https://private.invalid"}})
             if request.method == "GET" and self.mode != "probe-billing":
-                return {"data": [{"id": "fixture-model"}]}
+                model = "personal-probe-model" if path.startswith("personal/") else "fixture-model"
+                return {"data": [{"id": model}]}
             if path.endswith("messages"):
                 return {"content": [{"type": "text", "text": "fixture"}]}
             return JSONResponse(status_code=429, headers={"Retry-After": "1"}, content={
                 "error": {"code": "1113" if self.mode in ("billing", "probe-billing") else "rate_limit",
-                          "message": f"余额不足 {self.secret} https://private.invalid"}})
+                          "message": f"余额不足 {self.secret} {request.headers.get('authorization', '')} https://private.invalid"}})
 
         self.provider_url = await self.start_server(upstream)
         async with self.engine.begin() as connection:
@@ -98,13 +114,29 @@ class GatewayDiagnosticsTests(IsolatedDatabase):
         await super().asyncTearDown()
 
     async def test_discovery_success_does_not_certify_generation_and_billing_is_safe(self):
+        managed_probe = await self.http.post("/api/v1/my-models/test", headers=self.headers,
+                                             json={"providerId": "fixture"})
+        self.assertEqual(managed_probe.status_code, 403)
+        self.assertEqual(self.calls, [], "organization probes must not contact the provider")
+
+        catalog = (await self.http.get("/api/v1/my-models", headers=self.headers)).json()
+        personal_secret = secrets.token_hex(24)
+        saved = await self.http.put("/api/v1/my-models", headers=self.headers, json={
+            "expectedRevision": catalog["revision"], "providers": [{"id": "custom-probe",
+                "name": "Personal probe", "baseUrl": self.provider_url + "/personal/v1",
+                "kind": "openai-compat", "personal": True}],
+            "keys": {"custom-probe": personal_secret},
+            "models": [{"providerId": "custom-probe", "name": "personal-probe-model"}]})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(self.calls, [])
         probe = await self.http.post("/api/v1/my-models/test", headers=self.headers,
-                                     json={"providerId": "fixture"})
+                                     json={"providerId": "custom-probe"})
         self.assertEqual(probe.status_code, 200)
         self.assertTrue(probe.json()["ok"])
+        self.assertEqual(probe.json()["keyFrom"], "mine")
         self.assertEqual(probe.json()["probe"], "models")
         self.assertIn("尚未验证", probe.json()["detail"])
-        self.assertEqual(self.calls, [("GET", "v1/models")])
+        self.assertEqual(self.calls, [("GET", "personal/v1/models")])
         auth = {"Authorization": "Bearer " + self.ticket}
         for path in ("chat/completions", "responses"):
             for stream in (False, True):
@@ -121,6 +153,22 @@ class GatewayDiagnosticsTests(IsolatedDatabase):
                 self.assertNotIn(self.secret, response.text)
                 self.assertNotIn("private.invalid", response.text)
         self.assertEqual(len(self.calls), 5)
+        personal_config = await self.http.get("/api/v1/ai-proxy/config", headers=self.headers,
+                                             params={"model": "personal-probe-model"})
+        self.assertEqual(personal_config.status_code, 200, personal_config.text)
+        self.assertEqual(personal_config.json()["quotaScope"], "personal")
+        response = await self.http.post("/api/v1/ai-proxy/v1/chat/completions",
+            headers={"Authorization": "Bearer " + personal_config.json()["key"]},
+            json={"model": "personal-probe-model", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()["error"]["code"], "upstream_billing_error")
+        self.assertEqual(response.json()["error"]["providerCode"], "1113")
+        self.assertNotIn("retry-after", response.headers)
+        self.assertNotIn(personal_secret, response.text)
+        self.assertNotIn(self.secret, response.text)
+        self.assertNotIn("private.invalid", response.text)
+        self.assertEqual(self.calls[-1], ("POST", "personal/v1/chat/completions"))
+        self.assertEqual(len(self.calls), 6)
         self.mode = "transient"
         response = await self.http.post("/api/v1/ai-proxy/v1/chat/completions", headers=auth,
             json={"model": "fixture-model", "messages": [{"role": "user", "content": "hi"}]})
@@ -128,11 +176,12 @@ class GatewayDiagnosticsTests(IsolatedDatabase):
         self.assertEqual(float(response.headers["retry-after"]), 1)
         self.mode = "probe-billing"
         probe = (await self.http.post("/api/v1/my-models/test", headers=self.headers,
-                                     json={"providerId": "fixture"})).json()
+                                     json={"providerId": "custom-probe"})).json()
         self.assertFalse(probe["ok"])
         self.assertEqual(probe["providerCode"], "1113")
         self.assertIn("余额", probe["detail"])
         self.assertNotIn(self.secret, json.dumps(probe))
+        self.assertNotIn(personal_secret, json.dumps(probe))
         self.assertNotIn("private.invalid", json.dumps(probe))
 
     async def test_anthropic_stays_configurable_but_gateway_explains_the_boundary(self):
@@ -183,6 +232,27 @@ class GatewayDiagnosticsTests(IsolatedDatabase):
         self.assertEqual(process.returncode, 0, output.decode("utf-8", "replace"))
         self.assertIn(b'"retryAttempts":0', output)
         self.assertEqual(self.calls, [("POST", "v1/chat/completions")])
+
+    async def test_denial_keeps_safe_correlation_without_guessing_permission(self):
+        self.mode = "trace-denial"
+        auth = {"Authorization": "Bearer " + self.ticket}
+        for stream in (False, True):
+            response = await self.http.post("/api/v1/ai-proxy/v1/chat/completions", headers=auth,
+                json={"model": "fixture-model", "messages": [{"role": "user", "content": "hi"}], "stream": stream})
+            self.assertEqual(response.status_code, 200 if stream else 403)
+            payload = (json.loads(next(line[6:] for line in response.text.splitlines() if line.startswith("data: ")))
+                       if stream else response.json())["error"]
+            self.assertNotIn("权限", payload["message"])
+            self.assertRegex(payload["diagnosticId"], r"^[a-f0-9]{32}$")
+            self.assertIn("[soduwork-trace:" + payload["diagnosticId"] + "]", payload["message"])
+            self.assertEqual(payload["upstreamRequestId"], "fixture-request-183")
+            self.assertNotIn(self.secret, response.text)
+            self.assertNotIn("private.invalid", response.text)
+        self.mode = "unsafe-trace-denial"
+        response = await self.http.post("/api/v1/ai-proxy/v1/chat/completions", headers=auth,
+            json={"model": "fixture-model", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertNotIn("upstreamRequestId", response.json()["error"])
+        self.assertNotIn(self.secret, response.text)
 
 
 if __name__ == "__main__":

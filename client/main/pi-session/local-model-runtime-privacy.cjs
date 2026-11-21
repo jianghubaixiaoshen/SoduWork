@@ -17,6 +17,7 @@ function safeError(value) {
   const info = require('./model-errors').describe(value);
   const recovery = require('./context-recovery');
   const prefix = info.status ? 'HTTP ' + info.status + ': ' : '';
+  if (info.code === 'output_token_limit_exceeded') return prefix + info.code;
   if (recovery.OVERFLOW.test(info.raw)) {
     const size = recovery.errorWindow(value);
     return prefix + 'context_length_exceeded' + (size ? '; maximum context length is ' + size : '');
@@ -79,7 +80,14 @@ function install(runtime) {
           // Extensions observe only the opaque model reference. Restore the wire
           // name after their transformations so it cannot become persisted state.
           const transformed = await options.onPayload?.(payload, visibleModel);
-          return { ...(transformed === undefined ? payload : transformed), model: local.wireModelId };
+          const body = { ...(transformed === undefined ? payload : transformed), model: local.wireModelId };
+          if (local.thinkingMode === 'none') {
+            const requests = require('../model-capability-request.cjs');
+            Object.assign(body, requests.thinkingParams(requests.policy({ name: local.wireModelId,
+              config: { thinkingMode: 'none', thinkingFormat: local.thinkingFormat } })));
+            delete body.reasoning_effort;
+          }
+          return body;
         },
         async onProviderStreamEvent(chunk) {
           if (chunk && typeof chunk === 'object') {
@@ -111,7 +119,8 @@ function configure(runtime, target, next) {
   if (!target || next?.localOnly !== true) return target;
   const ref = reference(next);
   if (!String(next.wireModelId || '').trim()) throw new Error('Local model name is unavailable');
-  install(runtime).set(ref, { wireModelId: next.wireModelId, baseUrl: next.baseUrl, key: String(next.key || '') });
+  install(runtime).set(ref, { wireModelId: next.wireModelId, baseUrl: next.baseUrl, key: String(next.key || ''),
+    thinkingMode: next.thinkingMode, thinkingFormat: next.thinkingFormat });
   const headers = { ...target.headers };
   if (!String(next.key || '').trim()) headers.Authorization = null;
   else delete headers.Authorization;

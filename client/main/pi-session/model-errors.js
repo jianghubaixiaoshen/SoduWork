@@ -24,6 +24,8 @@ const STREAM_INTERRUPTION_RE = /^(?:TypeError:\s*)?terminated$|\bother side clos
 // not strip HTML and retain its internal addresses, request tokens or headers.
 const PRIVATE_RESPONSE_RE = /<\/?[a-z][^>]*>|<!doctype\b|&lt;\/?[a-z]|\b(?:https?|wss?):\/\/|\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:authorization|api[-_ ]?key|access[-_ ]?token|password|secret)\s*[:=]|\bbearer\s+\S+/i;
 const IMAGE_REJECTION_RE = /image[_ -]?input[_ -]?(?:rejected|unsupported)|(?:image|vision|multimodal).{0,50}(?:not supported|unsupported|rejected|maximum|limit)/i;
+const OUTPUT_LIMIT_MESSAGE = '请求的最大输出 Token 超过模型服务限制；请在模型配置中调整“最大输出 Token”，并核对“上下文窗口”';
+const OUTPUT_LIMIT_RE = /\b(?:max_(?:completion_|output_)?tokens|maxOutputTokens)\b.{0,160}(?:cannot be greater than|must be (?:less than|<=|at most)|exceeds?\b|too (?:large|high)|maximum (?:allowed|value)|is (?:greater|higher) than)/i;
 
 function textOf(value) {
   if (value == null) return '';
@@ -42,50 +44,71 @@ function payloadOf(source) {
   try { return JSON.parse(source.slice(start)); } catch (error) { return null; }
 }
 
+function classificationText(source) {
+  const envelope = payloadOf(source);
+  if (!envelope || typeof envelope !== 'object') return source;
+  // Correlation labels are opaque metadata, not provider error semantics.
+  return source.slice(0, source.indexOf('{')) + JSON.stringify(envelope,
+    (key, value) => ['diagnosticId', 'upstreamRequestId'].includes(key) ? undefined : value);
+}
+
 function statusOf(source, payload, error) {
   const explicit = [error, payload].filter(Boolean)
     .flatMap(item => [item.status, item.statusCode, item.code]).map(Number)
     .find(value => value >= 400 && value < 600);
   if (explicit >= 400 && explicit < 600) return explicit;
-  const match = source.match(/\bHTTP(?:\/\d(?:\.\d)?)?\s+([45]\d{2})\b|^([45]\d{2})(?=$|[\s:<({])|(?:^|\s)([45]\d{2})(?=\s*(?:[:{<]|status\s+code|\(no body\)))|<(?:title|h1)\b[^>]*>\s*([45]\d{2})\b/i);
+  const match = source.match(/\bHTTP(?:\/\d(?:\.\d)?)?\s+([45]\d{2})\b|^([45]\d{2})(?=$|[\s:<({])|(?:^|\s)([45]\d{2})(?=\s*(?:[:{<]|status\s+code|\(no body\)))|<(?:title|h1)\b[^>]*>\s*([45]\d{2})\b|rejected this request\s*\(([45]\d{2})\)/i);
   return Number(match && match.slice(1).find(Boolean) || LEGACY_CAPACITY_STATUS.get(source) || 0);
 }
 
-function describe(value) {
+function describe(value, afterToolResult = false) {
   const raw = textOf(value).trim();
+  const source = classificationText(raw);
+  // The Hub issues an opaque correlation token; provider headers/bodies are
+  // never copied into chat. SDKs may retain only this fixed message marker.
+  const diagnosticId = raw.match(/\[soduwork-trace:([a-f0-9]{32})\]/)?.[1] || '';
   const payload = value && typeof value === 'object' ? value : payloadOf(raw);
   const error = payload && payload.error && typeof payload.error === 'object'
     ? payload.error : payload;
-  const quota = require('../../core/token-quota').detail(payload || raw);
+  const quota = require('../../core/token-quota').detail(
+    payload instanceof Error ? { ...payload, message: source } : payload || source);
   if (quota) return { raw, payload, type: 'quota', status: 403, proxy: true, transient: false,
     retryable: false, code: quota.code, quota: quota.quota,
     publicText: '当前 AI 使用额度暂不可用，请查看额度详情' };
   const type = String(error && error.type || '');
-  const status = statusOf(raw, payload, error);
+  const status = statusOf(source, payload, error);
   const upstream = String(error && error.upstream || '');
-  const combined = [raw, String(error && error.message || ''), upstream].join(' ');
-  const proxy = /soduwork(?:_work)?_proxy_error/i.test(type + ' ' + raw);
+  const combined = [source, classificationText(String(error && error.message || '')), upstream].join(' ');
+  const proxy = /soduwork(?:_work)?_proxy_error/i.test(type + ' ' + source);
   const providerCode = String(error?.providerCode || error?.code || '') === '1113' ||
     /供应商错误码\s*[:：]?\s*1113\b/.test(combined) ? '1113' : '';
   const billing = Boolean(providerCode) || /upstream_billing_error|billing_required|insufficient_quota|insufficient_balance|billing_hard_limit_reached|余额不足|计费额度不可用/i.test(combined);
+  const outputLimit = [0, 400, 422].includes(status) && !billing &&
+    (OUTPUT_LIMIT_RE.test(combined) || /\boutput_token_limit_exceeded\b/.test(combined) || combined.includes(OUTPUT_LIMIT_MESSAGE));
   const transient = TRANSIENT_STATUS.has(status) || TRANSIENT_RE.test(combined) ||
     STREAM_INTERRUPTION_RE.test(raw) || STREAM_INTERRUPTION_RE.test(String(error && error.message || ''));
   const authExpired = !billing && status === 401 && AUTH_EXPIRED_RE.test(combined);
-  const permanent = billing || /insufficient_quota|quota exceeded|billing|out of budget|available balance|usage limit reached/i.test(combined) ||
+  const permanent = billing || outputLimit || /insufficient_quota|quota exceeded|billing|out of budget|available balance|usage limit reached/i.test(combined) ||
     [400,403,404,413,422].includes(status) || (status === 401 && !authExpired);
   const retryable = authExpired || (!permanent && (transient || proxy && status === 0));
 
   let publicText = '';
   const privateResponse = PRIVATE_RESPONSE_RE.test(raw) || Boolean(payload && !(payload instanceof Error));
-  if (billing || proxy || status || transient || privateResponse) {
+  if (billing || outputLimit || proxy || status || transient || privateResponse) {
     if (billing) {
       publicText = '模型服务余额不足或计费额度不可用' + (providerCode ? '（供应商错误码 1113）' : '') +
         '；请检查供应商账单、API Key 类型和接口地址';
+    } else if (outputLimit) {
+      publicText = OUTPUT_LIMIT_MESSAGE;
+    } else if ([400, 422].includes(status) && error?.code === 'thinking_disabled_unsupported') {
+      publicText = '该模型不支持关闭思考；请在模型高级设置把“思考能力”改为“始终开启”后重试';
     } else if (/context_length_exceeded|context length exceeded|prompt (?:is )?too long/i.test(combined)) {
       publicText = '当前上下文超过模型容量，历史和本轮输入已保留';
     } else if (IMAGE_REJECTION_RE.test(combined)) {
       publicText = '当前模型不接受图片输入，请切换支持图片的模型或启用视觉适配';
-    } else if (status === 401 || status === 403) {
+    } else if (status === 403) {
+      publicText = afterToolResult ? '工具已完成，请求模型继续生成时被拒绝' : '模型请求被拒绝';
+    } else if (status === 401) {
       publicText = '模型服务拒绝了当前凭据或模型权限';
     } else if (status === 404) {
       publicText = '模型服务地址或模型不存在';
@@ -98,12 +121,15 @@ function describe(value) {
     }
     if (status) publicText += '（HTTP ' + status + '）';
   }
+  if (publicText && diagnosticId) publicText += ' [soduwork-trace:' + diagnosticId + ']';
   return { raw, payload, type, status, proxy, transient, authExpired, retryable, publicText,
-    ...(billing ? { code: 'upstream_billing_error', providerCode } : {}) };
+    ...(diagnosticId ? { diagnosticId } : {}),
+    ...(billing ? { code: 'upstream_billing_error', providerCode } : {}),
+    ...(outputLimit ? { code: 'output_token_limit_exceeded' } : {}) };
 }
 
-function forDisplay(value, limit = 200) {
-  const info = describe(value);
+function forDisplay(value, limit = 200, afterToolResult = false) {
+  const info = describe(value, afterToolResult);
   if (!info.raw) return '';
   if (info.publicText) return info.publicText;
   return info.raw.replace(/\s+/g, ' ').trim().slice(0, Math.max(40, Number(limit) || 200));

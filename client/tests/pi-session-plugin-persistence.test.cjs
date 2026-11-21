@@ -22,7 +22,7 @@ test('Pi executes inherited plugins with fresh grants, restores selections, cons
     fs.mkdirSync(cwd); fs.mkdirSync(agentDir);
     const resolutions = [], cleanups = [], executions = [], priorResults = [], requests = [], sessions = [];
     const grants = new Set(), archives = new Map();
-    let held = null, holdNext = false, revoked = false;
+    let held = null, holdNext = false, revoked = false, generation = false, generated = 0, failNative = false, freezeWrites = false, htmlOnly = false;
     const server = http.createServer((request, response) => {
       let raw = '';
       request.on('data', chunk => { raw += chunk; });
@@ -30,7 +30,9 @@ test('Pi executes inherited plugins with fresh grants, restores selections, cons
         const body = JSON.parse(raw); requests.push(body);
         const user = body.messages.findLast(message => message.role === 'user');
         const prompt = JSON.stringify(user?.content || '');
-        const grant = /PLUGIN-GRANT-(\d+)/.exec(prompt)?.[1];
+        const grant = /PLUGIN-GRANT-(\d+)/.exec(prompt)?.[1] || (generation
+          ? /PLUGIN-GRANT-(\d+)/.exec(JSON.stringify(body.messages.findLast(message =>
+            /PLUGIN-GRANT-/.test(JSON.stringify(message.content || '')))?.content || ''))?.[1] : '');
         const textOf = message => typeof message?.content === 'string' ? message.content
           : (Array.isArray(message?.content) ? message.content
             .filter(block => block?.type === 'text').map(block => block.text || '').join('\n') : '');
@@ -38,9 +40,14 @@ test('Pi executes inherited plugins with fresh grants, restores selections, cons
           .filter(message => message?.role === 'tool' || message?.role === 'toolResult')
           .map(textOf).filter(Boolean);
         const lastRole = body.messages.at(-1)?.role;
+        if (failNative && ['tool','toolResult'].includes(lastRole)) {
+          response.writeHead(400, {'content-type':'application/json'});
+          response.end(JSON.stringify({error:{message:'Synthetic native generation failure'}}));return;
+        }
         const call = grant && !['tool', 'toolResult'].includes(lastRole);
-        const delta = call ? { role: 'assistant', tool_calls: [{ index: 0, id: 'probe-' + grant,
+        const delta = call ? { role: 'assistant', tool_calls: [{ index: 0, id: 'probe-' + grant + (generation ? '-' + requests.length : ''),
           type: 'function', function: { name: 'plugin_probe', arguments: JSON.stringify({ grant,
+            ...(generation ? {repair:prompt.includes('<soduwork-internal-plugin-repair>')} : {}),
             ...(historicalResults.length ? { priorResult: historicalResults.at(-1) } : {}) }) } }] }
           : { role: 'assistant', content: 'Fixture completed.' };
         const respond = () => {
@@ -68,12 +75,28 @@ test('Pi executes inherited plugins with fresh grants, restores selections, cons
       modelsStorePath: path.join(root, 'models.db') });
     runtime.registerProvider('soduwork', piProvider(fixtureModel));
     const probe = { name: 'plugin_probe', label: 'Fixture plugin', description: 'Uses the current plugin grant',
-      parameters: { type: 'object', properties: { grant: { type: 'string' }, priorResult: { type: 'string' } }, required: ['grant'] },
+      parameters: { type: 'object', properties: { grant: { type: 'string' }, priorResult: { type: 'string' }, repair: {type:'boolean'} }, required: ['grant'] },
       async execute(_id, args) {
         assert.ok(grants.has(args.grant), 'the tool must have a live grant belonging to this turn');
-        const expected = executions.length ? 'PLUGIN-RESULT-' + executions.at(-1) : undefined;
+        const expected = generation && generated === 0 ? undefined : executions.length ? 'PLUGIN-RESULT-' + executions.at(-1) : undefined;
         assert.equal(args.priorResult, expected,
           'a follow-up plugin call must receive the previous turn tool result from native history');
+        if (generation && (!freezeWrites || args.repair)) {
+          const target = path.join(cwd, 'soduwork-plugin-draft.json');
+          generated++;
+          if (htmlOnly && !args.repair) {
+            fs.writeFileSync(path.join(cwd, 'report.html'), '<!doctype html><h1>Business report</h1>');
+            if (htmlOnly === 'manifest') {
+              fs.mkdirSync(path.join(cwd, '.soduwork'), { recursive: true });
+              fs.writeFileSync(path.join(cwd, '.soduwork/delivery.json'), JSON.stringify({
+                schemaVersion: 1, deliverables: [{ path: 'report.html' }],
+              }));
+            }
+          } else fs.writeFileSync(target, generated === 1 ? '{invalid final JSON' : JSON.stringify({
+            template:'method', key:'native-gate-fixture', name:'Native fixture', version:'1.0.0',
+            description:'Synthetic generation validation', instructions:'Read the supplied material.',
+          }));
+        }
         executions.push(args.grant);
         priorResults.push(args.priorResult || '');
         return { content: [{ type: 'text', text: 'PLUGIN-RESULT-' + args.grant }], details: {} };
@@ -185,4 +208,76 @@ test('Pi executes inherited plugins with fresh grants, restores selections, cons
     assert.deepEqual(cleanups, executions, 'each issued grant is cleaned once after its tool finishes');
     assert.deepEqual(priorResults, ['', ...executions.slice(0, -1).map(grant => 'PLUGIN-RESULT-' + grant)],
       'each later plugin turn consumes the immediately preceding structured result');
+
+    // The actual SDK must repair inside the original grant and logical queue turn.
+    generation = true;
+    const author = await open({ref:'authoring'}), beforeGrants=resolutions.length;
+    const beforeUsers=author.snapshot().messages.filter(message=>message.role==='user').length;
+    const result=await author.submit('Generate a synthetic plugin draft',[],{pluginIds:['authoring']}).completion;
+    assert.equal(result.ok,true,result.reason);
+    assert.equal(generated,2,'one generation and one host-requested repair execute');
+    assert.equal(resolutions.length,beforeGrants+1,'repair reuses the live original plugin grant');
+    assert.equal(author.snapshot().messages.filter(message=>message.role==='user').length,beforeUsers+1,
+      'hidden repair must not create a new user turn');
+    const validated=(await author.outputSnapshotAsync()).pluginValidation;
+    assert.equal(validated.find(row=>row.relative==='soduwork-plugin-draft.json').state,'ready');
+    assert.equal(grants.size,0,'original grant is cleaned after static validation and repair settle');
+
+    // A provider failure exits before finish; finally must still release the gate.
+    failNative = true; generated = 0;
+    const failing = await open({ref:'failed-authoring'});
+    const failed = await failing.submit('Generate then fail natively',[],{pluginIds:['authoring']}).completion;
+    assert.equal(require('../main/pi-session/task-turn').resultState(failed),'failed');
+    await until(()=>!failing.inFlight());
+    const inspected = await require('../main/pi-session/plugin-generation-gate.cjs').inspect({
+      handle:failing,snapshot:await failing.outputSnapshotAsync(),
+    });
+    assert.equal(inspected.find(row=>row.relative==='soduwork-plugin-draft.json')?.state,'invalid',
+      'failed native generation must release inspection instead of leaving an active gate');
+
+    // An internal recovery leaves the earlier invalid draft unchanged until the
+    // shared logical gate requests its repair inside the recovery's live grant.
+    failNative = false; freezeWrites = true;
+    const recovered = await failing.send('Synthetic native runtime recovery',[],{
+      internal:true,runtimeRecovery:true,pluginIds:['authoring'],
+    });
+    assert.equal(recovered.ok,true,recovered.reason);
+    assert.equal(generated,2,'recovery must gate the original changed draft instead of treating it as old');
+    assert.equal((await failing.outputSnapshotAsync()).pluginValidation.find(row=>
+      row.relative==='soduwork-plugin-draft.json').state,'ready');
+    // Both inferred and explicitly declared one-off HTML results must be
+    // repaired through the actual SDK and live grant at authoring completion.
+    for (const source of ['inferred', 'manifest']) {
+      htmlOnly = source; freezeWrites = false; generated = 0;
+      for (const name of ['soduwork-plugin-draft.json', 'report.html', '.soduwork/delivery.json']) fs.rmSync(path.join(cwd, name), { force: true });
+      const htmlAuthor = await open({ ref: 'html-authoring-' + source }), htmlGrants = resolutions.length;
+      const htmlResult = await htmlAuthor.submit('Make a plugin that produces HTML', [], { pluginIds: ['local:plugin-builder'] }).completion;
+      assert.equal(htmlResult.ok, true, htmlResult.reason);
+      assert.equal(generated, 2, 'one HTML generation and one missing-package repair execute');
+      assert.equal(resolutions.length, htmlGrants + 1, 'missing-package repair retains the original grant');
+      assert.equal(htmlAuthor.snapshot().messages.filter(message => message.role === 'user').length, 1);
+      assert.equal((await htmlAuthor.outputSnapshotAsync()).pluginValidation.find(row =>
+        row.relative === 'soduwork-plugin-draft.json').state, 'ready');
+      assert.equal(grants.size, 0);
+      assert.match(fs.readFileSync(path.join(cwd, 'report.html'), 'utf8'), /Business report/);
+    }
+    // Real Pi requests must carry authoring intent even when the visible text
+    // only describes the future plugin's business behavior.
+    generation = false; executions.length = 0; priorResults.length = 0;
+    const featureAuthor = await open({ ref: 'feature-authoring' });
+    const latestUserText = () => {
+      const content = requests.at(-1).messages.findLast(message => message.role === 'user').content;
+      return typeof content === 'string' ? content : content.filter(item => item.type === 'text').map(item => item.text).join('\n');
+    };
+    const feature = '我给你区域范围、时间、人数和偏好，输出预算、路线和 HTML 旅行计划。';
+    for (const [text, options] of [[feature, { pluginIds: ['local:plugin-builder'] }], ['再支持随机推荐', {}]]) {
+      await send(featureAuthor, text, options);
+      assert.match(latestUserText(), /"authoring":\{"intent":"plugin-authoring"/);
+      assert.match(latestUserText(), /changing values.*plugin inputs/);
+      assert.equal(require('../main/pi-session/plugin-context').parse(latestUserText()).text, text);
+    }
+    await send(featureAuthor, '改为普通旅行讨论', { clearPluginSelection: true });
+    assert.doesNotMatch(latestUserText(), /"authoring":/);
+    assert.doesNotMatch(JSON.stringify(featureAuthor.snapshot().messages), /"authoring":|changing values/);
+    await require('../main/app-resource-cache.cjs').close();
   });

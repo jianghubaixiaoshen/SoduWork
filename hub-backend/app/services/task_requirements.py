@@ -321,7 +321,7 @@ async def decorate(session, client, task, api, *, context=None, prepared=None, e
         prepared=prepared.repository_issues if prepared is not None else None)
 
 
-async def apply(session, client, task, data, *, creating=False):
+async def apply(session, client, task, data, *, creating=False, preserve_title=False):
     """Consume preparation fields. Keep execution updates in task_status.mark."""
     from . import task_access
     edit_facts = None
@@ -334,8 +334,11 @@ async def apply(session, client, task, data, *, creating=False):
     if "priority" in data and data["priority"] not in {"low", "normal", "high", "critical"}:
         raise HTTPException(400, "优先级不正确")
     if "title" in data:
-        data["title"] = str(data["title"] or "").strip()[:200]
-        if not data["title"]:
+        # Legacy PUT replay includes complete saved text, including undo after a
+        # successful DELETE. Never shorten that text while acknowledging a save.
+        title = str(data["title"] or "")
+        data["title"] = title if preserve_title else title.strip()[:200]
+        if not data["title"].strip():
             raise HTTPException(400, "请填写需求标题")
     if not creating and task.status != "todo" and {"kind", "acceptanceCriteria"}.intersection(data):
         raise HTTPException(409, "需求已进入执行，不能更改原完成标准")
@@ -426,6 +429,9 @@ async def forget_previous_viewers(session, task, previous_org):
 async def update_shared(session, client, task, data):
     if not await can_manage(session, client, task):
         raise HTTPException(403, "你只能查看这条需求")
+    from . import requirement_timeline
+    previous_definition = requirement_timeline.definition(task)
+    previous_definition_version = int(task.requirement_version or 1)
     restore_cancelled = (task.status == "cancel" and "archivedAt" in data and
                          data["archivedAt"] is None and data.get("status") == "todo")
     if set(data) - (EXTRA_KEYS | BUSINESS_KEYS | ({"status"} if restore_cancelled else set())):
@@ -456,6 +462,7 @@ async def update_shared(session, client, task, data):
     # requirementVersion already increment it conditionally in apply.
     if not requirement_edit and set(data) & tasks._REQ_CONTENT_KEYS:
         task.requirement_version = int(task.requirement_version or 1) + 1
+    await requirement_timeline.record_definition(session, task, previous_definition, previous_definition_version)
     from . import task_notifications
     task_notifications.enqueue(session, task, "task.updated", previous_org=previous_org)
     await session.commit()

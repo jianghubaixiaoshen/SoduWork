@@ -2,16 +2,20 @@
 device management. Superusers see all records; other users see their department subtree and
 unassigned devices. Client.user_ref determines device ownership.
 """
-from datetime import datetime, timedelta, timezone
+from typing import Annotated
+from datetime import date as calendar_date, datetime, timedelta, timezone
 import logging
+import uuid
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
-from sqlalchemy import case, func, or_, select
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import models
 from ..auth import sign_token, verify_password
 from ..config import get_settings
+from ..services.catalog_names import DuplicateName
+from ..pagination import PageQuery
 from ..db import get_session
 from ..deps import current_user, has_perm, require_perm
 from ..models import Attachment, Client, Role, Task, TaskEvent, User
@@ -42,6 +46,7 @@ from ..services.task_access import publish_owner
 from ..services import inbox as inbox_svc
 from ..services import poller
 from ..services import rbac
+from ..services import email_auth
 from ..services import client_access
 from ..services import storage
 from ..services import tasks as svc
@@ -49,6 +54,7 @@ from ..services import work_catalog
 from ..services import device_auth
 from ..services import device_connections
 from ..services import environment_service
+from .input_validation import parse_integer
 
 log = logging.getLogger("uvicorn.error")
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
@@ -83,9 +89,26 @@ async def _me_payload(session: AsyncSession, user: User) -> dict:
 
 
 @router.post("/login")
-async def login(body: AdminLogin, session: AsyncSession = Depends(get_session)):
+async def login(body: AdminLogin, request: Request, session: AsyncSession = Depends(get_session)):
     user = await client_access.find_login_user(session, body.user, legacy_lookup=rbac.get_user_by_username)
-    if user is None or not user.is_active or user.account_deleted_at or not verify_password(body.pw, user.password_hash):
+    # Verified email and legacy username can identify the same account.
+    account = "id:" + user.id if user is not None else "name:" + body.user.strip().casefold()
+    peer = request.client.host if request.client else "unknown"
+    async with session.begin_nested() as reservation:
+        try:
+            await email_auth.reserve_admin_login(session, account, peer)
+        except client_access.ClientAccessError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc),
+                                headers={"Retry-After": str(exc.meta["retryAfter"])}) from exc
+        authenticated = bool(user and user.is_active and not user.account_deleted_at
+                             and verify_password(body.pw, user.password_hash))
+        if authenticated:
+            # Only failed attempts consume the account and peer budgets.
+            await reservation.rollback()
+        else:
+            audit.add(session, None, "admin.login.failed", "user", user.id if user else None)
+    if not authenticated:
+        await session.commit()
         raise HTTPException(status_code=401, detail="账号或密码不正确")
     user.last_login_at = datetime.now(timezone.utc)
     await session.commit()
@@ -123,6 +146,11 @@ async def _assert_org_in_scope(session: AsyncSession, user: User, org_id: str | 
         raise HTTPException(status_code=403, detail="只能在自己管辖的部门内操作")
 
 
+async def _require_existing_org(session: AsyncSession, org_id: str):
+    if org_id and await session.get(models.OrgUnit, org_id) is None:
+        raise HTTPException(status_code=400, detail="部门不存在")
+
+
 async def _assert_user_in_scope(session: AsyncSession, user: User, target: User):
     if user.is_super:
         return
@@ -144,6 +172,8 @@ def _org_mutation_error(exc: rbac.OrgMutationError) -> HTTPException:
         "out_of_scope": (403, "只能在自己管辖的部门内操作"),
         "parent_not_found": (400, "上级部门不存在"),
         "cycle": (400, "部门不能移动到自身或下级部门"),
+        "invalid_name": (400, "部门名称须为 1 至 64 个字符"),
+        "duplicate_name": (409, "同级部门已使用这个名称"),
     }.get(exc.reason, (400, "组织架构操作无效"))
     return HTTPException(status_code=status, detail=message)
 
@@ -151,8 +181,9 @@ def _org_mutation_error(exc: rbac.OrgMutationError) -> HTTPException:
 # Organizational structure.
 
 @router.get("/orgs")
-async def list_orgs(user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
-    return await rbac.list_orgs(session, await rbac.scope_org_ids(session, user))
+async def list_orgs(user: User = Depends(current_user), session: AsyncSession = Depends(get_session),
+                    window: PageQuery = None):
+    return await rbac.list_orgs(session, await rbac.scope_org_ids(session, user), page=window)
 
 
 @router.post("/orgs")
@@ -203,7 +234,9 @@ async def delete_org(
         raise _org_mutation_error(exc) from exc
     if not r["ok"]:
         msg = {"has_children": "该部门下还有子部门", "has_users": "该部门下还有用户", "not_found": "部门不存在"}
-        raise HTTPException(status_code=400, detail=msg.get(r["reason"], "无法删除"))
+        reason = r["reason"]
+        raise HTTPException(status_code=404 if reason == "not_found" else 400, detail=msg.get(reason, "无法删除"),
+                            headers={"X-Error-Code": f"org.delete.{reason}"})
     await audit.log(session, user, "org.delete", "org", oid, r.get("name", ""), {})
     return r
 
@@ -211,15 +244,21 @@ async def delete_org(
 # Roles.
 
 @router.get("/roles")
-async def list_roles(user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
-    return await rbac.list_roles(session)
+async def list_roles(user: User = Depends(current_user), session: AsyncSession = Depends(get_session),
+                    window: PageQuery = None):
+    return await rbac.list_roles(session, page=window)
 
 
 @router.post("/roles")
 async def create_role(body: RoleCreate,
                       user: User = Depends(require_perm("role.manage")),
                       session: AsyncSession = Depends(get_session)):
-    result = await rbac.create_role(session, body.name, body.permissions)
+    try:
+        result = await rbac.create_role(session, body.name, body.permissions)
+    except DuplicateName as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     await audit.log(session, user, "role.create", "role", result.get("id"),
                     result.get("name", ""), {"permissions": result.get("permissions", [])})
     return result
@@ -229,7 +268,12 @@ async def create_role(body: RoleCreate,
 async def update_role(rid: str, body: RoleUpdate,
                       user: User = Depends(require_perm("role.manage")),
                       session: AsyncSession = Depends(get_session)):
-    r = await rbac.update_role(session, rid, body.name, body.permissions)
+    try:
+        r = await rbac.update_role(session, rid, body.name, body.permissions)
+    except DuplicateName as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if r is None:
         raise HTTPException(status_code=404, detail="角色不存在")
     await audit.log(session, user, "role.update", "role", rid, r.get("name", ""),
@@ -246,7 +290,9 @@ async def delete_role(rid: str,
     r = await rbac.delete_role(session, rid)
     if not r["ok"]:
         msg = {"system_role": "系统内置角色不可删", "in_use": "仍有用户在用该角色", "not_found": "角色不存在"}
-        raise HTTPException(status_code=400, detail=msg.get(r["reason"], "无法删除"))
+        reason = r["reason"]
+        raise HTTPException(status_code=404 if reason == "not_found" else 400, detail=msg.get(reason, "无法删除"),
+                            headers={"X-Error-Code": f"role.delete.{reason}"})
     await audit.log(session, user, "role.delete", "role", rid, label, {})
     return r
 
@@ -254,8 +300,9 @@ async def delete_role(rid: str,
 # Users within the current scope.
 
 @router.get("/users", dependencies=[Depends(require_perm("user.manage"))])
-async def list_users(user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
-    return await rbac.list_users(session, await rbac.scope_org_ids(session, user))
+async def list_users(user: User = Depends(current_user), session: AsyncSession = Depends(get_session),
+                    window: PageQuery = None):
+    return await rbac.list_users(session, await rbac.scope_org_ids(session, user), page=window)
 
 
 @router.post("/users")
@@ -269,17 +316,31 @@ async def create_user(
     if not body.orgId:
         raise HTTPException(status_code=400, detail="请为用户指定所属部门")
     await _assert_org_in_scope(session, user, body.orgId)
+    if body.roleId and await rbac.lock_role_reference(session, body.roleId) is None:
+        raise HTTPException(status_code=400, detail="角色不存在")
+    if body.domains:
+        domain_ids = {str(value) for value in body.domains}
+        found = set((await session.scalars(select(models.Domain.id).where(
+            models.Domain.id.in_(domain_ids)))).all())
+        missing = sorted(domain_ids - found)
+        if missing:
+            raise HTTPException(status_code=400, detail="业务域不存在：" + ", ".join(missing))
+    await _require_existing_org(session, body.orgId)
     if await rbac.get_user_by_username(session, body.username):
         raise HTTPException(status_code=400, detail="用户名已存在")
     try:
         position_ids = await work_catalog.validate_profession_ids(
             session, body.orgId, body.positions or [])
+        await rbac.validate_user_domains(session, body.domains)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    created = await rbac.create_user(
-        session, body.username, body.password, body.displayName,
-        body.orgId, body.roleId, position_ids, body.domains,
-        token_quota=body.tokenQuota.model_dump() if body.tokenQuota is not None else None)
+    try:
+        created = await rbac.create_user(
+            session, body.username, body.password, body.displayName,
+            body.orgId, body.roleId, position_ids, body.domains,
+            token_quota=body.tokenQuota.model_dump() if body.tokenQuota is not None else None)
+    except client_access.ClientAccessError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
     await audit.log(session, user, "user.create", "user", created.get("id"), created.get("displayName") or body.username,
                     {"orgId": body.orgId, "roleId": body.roleId})
     return created
@@ -298,28 +359,48 @@ async def update_user(
     await _assert_user_in_scope(session, user, target)
     if body.orgId is not None:
         await _assert_org_in_scope(session, user, body.orgId)
+        await _require_existing_org(session, body.orgId)
+    # An empty roleId is the legacy form used by clients to clear a role.
+    # Validate non-empty assignments while preserving that clearing behavior.
+    if body.roleId and await rbac.lock_role_reference(session, body.roleId) is None:
+        raise HTTPException(status_code=400, detail="角色不存在")
+    if body.domains is not None:
+        domain_ids = {str(value) for value in body.domains}
+        found = set((await session.scalars(select(models.Domain.id).where(
+            models.Domain.id.in_(domain_ids)))).all())
+        missing = sorted(domain_ids - found)
+        if missing:
+            raise HTTPException(status_code=400, detail="业务域不存在：" + ", ".join(missing))
     if target.is_super and body.isActive is False:
         raise HTTPException(status_code=400, detail="不能停用超级管理员")
     was_active = bool(target.is_active)
     patch = body.model_dump(exclude_none=True)
+    # Explicit null clears the role; omitting the field preserves it.
+    if "roleId" in body.model_fields_set:
+        patch["roleId"] = body.roleId
     target_org_id = body.orgId if body.orgId is not None else target.org_id
-    if body.positions is not None or body.orgId is not None:
-        try:
+    try:
+        await rbac.validate_user_domains(session, body.domains)
+        if body.positions is not None or body.orgId is not None:
             patch["positions"] = await work_catalog.validate_profession_ids(
                 session, target_org_id,
                 body.positions if body.positions is not None else target.positions)
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-    updated = await rbac.update_user(session, uid, patch)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    client_ids = []
     if was_active and patch.get("isActive") is False:
-        bound_clients = list((await session.execute(
-            select(Client).where(Client.user_ref == uid)
-        )).scalars().all())
-        for bound in bound_clients:
-            if bound.auth_state != "revoked":
-                device_auth.revoke(bound)
-        await session.commit()
-        client_ids = [bound.id for bound in bound_clients]
+        # End this account's sessions while preserving device identity/history
+        # and explicit administrator bans. rbac.update_user commits both changes.
+        client_ids = list((await session.scalars(update(Client).where(
+            Client.user_ref == uid, Client.auth_state != "revoked",
+        ).values(auth_state="pending", auth_version=Client.auth_version + 1,
+                 activated_at=None, revoked_at=None).returning(Client.id)
+            .execution_options(synchronize_session=False))).all())
+    try:
+        updated = await rbac.update_user(session, uid, patch)
+    except client_access.ClientAccessError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    if client_ids:
         await device_connections.disconnect_many(client_ids)
     await audit.log(session, user, "user.update", "user", uid, target.display_name or target.username,
                     {"fields": [k for k in patch if k != "password"], "pwChanged": "password" in patch})
@@ -347,6 +428,7 @@ async def create_position(
     if not org_id:
         raise HTTPException(status_code=400, detail="请先选择所属组织")
     await _assert_org_in_scope(session, user, org_id)
+    await _require_existing_org(session, org_id)
     try:
         row = await work_catalog.save_profession(session, body, org_id)
     except ValueError as error:
@@ -402,8 +484,9 @@ async def delete_position(
 # Responsibility catalog: readable by authenticated users; mutations require user.manage.
 
 @router.get("/domains")
-async def list_domains(user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
-    return await rbac.list_domains(session)
+async def list_domains(user: User = Depends(current_user), session: AsyncSession = Depends(get_session),
+                    window: PageQuery = None):
+    return await rbac.list_domains(session, page=window)
 
 
 @router.post("/domains")
@@ -412,7 +495,13 @@ async def create_domain(
     user: User = Depends(require_perm("user.manage")),
     session: AsyncSession = Depends(get_session),
 ):
-    r = await rbac.create_domain(session, (body.get("name") or "").strip(), int(body.get("sort") or 0))
+    sort = parse_integer(body.get("sort"), field="sort", default=0)
+    try:
+        r = await rbac.create_domain(session, body.get("name"), sort)
+    except DuplicateName as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="领域名称必须为 1 到 64 个字符") from exc
     await audit.log(session, user, "domain.create", "domain", r["id"], r["name"], {})
     return r
 
@@ -424,7 +513,19 @@ async def update_domain(
     user: User = Depends(require_perm("user.manage")),
     session: AsyncSession = Depends(get_session),
 ):
-    r = await rbac.update_domain(session, did, body.get("name"), body.get("sort"))
+    # Omitted/null sort retains the previous rank; a supplied value must be
+    # validated before the service can mutate either name or sort.
+    sort = body.get("sort")
+    if sort is not None:
+        sort = parse_integer(sort, field="sort")
+    if "name" in body and body["name"] is None:
+        raise HTTPException(status_code=422, detail="领域名称必须为 1 到 64 个字符")
+    try:
+        r = await rbac.update_domain(session, did, body.get("name"), sort)
+    except DuplicateName as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="领域名称必须为 1 到 64 个字符") from exc
     if r is None:
         raise HTTPException(status_code=404, detail="领域不存在")
     await audit.log(session, user, "domain.update", "domain", did, r["name"], {})
@@ -439,7 +540,9 @@ async def delete_domain(
 ):
     r = await rbac.delete_domain(session, did)
     if not r.get("ok"):
-        msg = {"not_found": "领域不存在", "system": "内置领域不可删除"}.get(r.get("reason"), "删除失败")
+        msg = {"not_found": "领域不存在", "system": "内置领域不可删除",
+               "users_remain": "仍有用户属于该领域，先移除用户关联",
+               "in_use": "仍有用户使用该业务域，请先解除关联"}.get(r.get("reason"), "删除失败")
         raise HTTPException(status_code=404 if r.get("reason") == "not_found" else 400, detail=msg)
     await audit.log(session, user, "domain.delete", "domain", did, did, {})
     return r
@@ -447,25 +550,55 @@ async def delete_domain(
 
 # Scoped device fleet and SoduWork ownership.
 
+class ClientListFilters:
+    def __init__(self, q: str = Query(default="", max_length=120),
+                 state: str = Query(default="all", pattern="^(all|online|offline|pending)$"),
+                 form: str = Query(default="all", pattern="^(all|desktop|mobile)$")):
+        self.q = q
+        self.state = state
+        self.form = form
+
+
+ClientFilters = Annotated[ClientListFilters, Depends()]
+ClientPageNumber = Annotated[int | None, Query(ge=1, le=2**31-1)]
+ClientPageSize = Annotated[int | None, Query(alias="pageSize", ge=1, le=100)]
+
+
 @router.get("/clients")
 async def list_clients(
-    paged: bool = Query(default=False),
-    q: str = Query(default="", max_length=120),
-    state: str = Query(default="all", pattern="^(all|online|offline|pending)$"),
-    form: str = Query(default="all", pattern="^(all|desktop|mobile)$"),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=25, alias="pageSize", ge=10, le=100),
+    filters: ClientFilters, paged: bool = Query(default=False),
+    page: ClientPageNumber = None, page_size: ClientPageSize = None, window: PageQuery = None,
     user: User = Depends(require_perm("client.view")),
     session: AsyncSession = Depends(get_session),
 ):
+    """Legacy unpaged clients receive an array. Use /client-inventory for a stable envelope."""
+    if paged or window:
+        return await paged_clients(filters, page, page_size, window, user, session)
     vis = await _visible_client_ids(session, user)
-    if not paged:
-        res = await session.execute(select(Client).order_by(Client.created_at.desc()))
-        return [
-            client_to_api(c, settings.offline_after_seconds)
-            for c in res.scalars().all()
-            if vis is None or c.id in vis
-        ]
+    query = select(Client).order_by(Client.created_at.desc(), Client.id)
+    if vis is not None:
+        query = query.where(Client.id.in_(vis))
+    return [client_to_api(c, settings.offline_after_seconds) for c in await session.scalars(query)]
+
+
+@router.get("/client-inventory")
+async def paged_clients(
+    filters: ClientFilters, page: ClientPageNumber = None, page_size: ClientPageSize = None,
+    window: PageQuery = None, user: User = Depends(require_perm("client.view")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Return items, total and counts for every request, including an empty page."""
+    vis = await _visible_client_ids(session, user)
+    if window:
+        if page is not None or page_size is not None:
+            raise HTTPException(status_code=422, detail="请选择一种分页方式：limit/offset 或 page/pageSize",
+                                headers={"X-Error-Code": "hub.input.pages"})
+        offset, page_size = window.offset, window.limit
+        page = offset // page_size + 1
+    else:
+        page, page_size = page or 1, page_size or 25
+        offset = (page - 1) * page_size
+    state, form, q = filters.state, filters.form, filters.q
 
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=settings.offline_after_seconds)
     scope = [] if vis is None else [Client.id.in_(vis)]
@@ -513,9 +646,9 @@ async def list_clients(
         .where(*scope, *state_where, *form_where, *search)
         .order_by(
             case((Client.last_seen_at >= cutoff, 1), else_=0).desc(),
-            Client.created_at.desc(),
+            Client.created_at.desc(), Client.id,
         )
-        .offset((page - 1) * page_size).limit(page_size)
+        .offset(offset).limit(page_size)
     )
     rows = await session.execute(query)
     items = []
@@ -524,7 +657,7 @@ async def list_clients(
         item["ownerName"] = display_name or username or ""
         items.append(item)
     return {
-        "items": items, "total": total, "page": page, "pageSize": page_size,
+        "items": items, "total": total, "page": page, "pageSize": page_size, "offset": offset,
         "counts": {
             "all": all_count, "online": online_count,
             "offline": all_count - online_count, "pending": pending_count,
@@ -719,6 +852,12 @@ async def list_daily_reports(
     from ..services import daily_report as dr, team_daily_report as tdr
     day = (date or "").strip() or dr.today_str()
     try:
+        parsed_date = calendar_date.fromisoformat(day)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="非法日期，请使用 YYYY-MM-DD 格式") from None
+    if parsed_date > calendar_date.today():
+        raise HTTPException(status_code=400, detail="日报只能查询今天或之前的日期")
+    try:
         data = await tdr.overview(session, user, day, org_id)
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error
@@ -741,6 +880,12 @@ async def generate_daily_reports(
     """
     from ..services import daily_report as dr, team_daily_report as tdr
     day = (body.get("date") or "").strip() or dr.today_str()
+    try:
+        parsed_date = calendar_date.fromisoformat(day)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="非法日期，请使用 YYYY-MM-DD 格式") from None
+    if parsed_date > calendar_date.today():
+        raise HTTPException(status_code=400, detail="不允许为未来日期生成日报")
     uid = (body.get("userId") or "").strip()
 
     scope = await rbac.scope_org_ids(session, user)
@@ -833,7 +978,9 @@ async def upload_task_attachment(
         raise HTTPException(status_code=400, detail="空文件")
     fn = (file.filename or "file").replace("/", "_").replace("\\", "_").strip()[:200] or "file"
     ct = file.content_type or "application/octet-stream"
-    a = Attachment(task_id=tid, filename=fn, content_type=ct, size=len(data), uploaded_by="admin:" + user.id)
+    # The column default is applied at flush; the storage key needs the id now.
+    a = Attachment(id=str(uuid.uuid4()), task_id=tid, filename=fn, content_type=ct, size=len(data),
+                   uploaded_by="admin:" + user.id)
     a.storage_key = f"att/{tid}/{a.id}/{fn}"
     a.backend = storage.put(a.storage_key, data, ct)
     session.add(a)
@@ -1289,6 +1436,7 @@ async def discover_model_provider(
         raise HTTPException(status_code=404, detail="这个模型服务不存在")
     if not p.enabled or not p.base_url or not p.api_key:
         return {"ok": False, "models": [], "known": [],
+                "code": "model.discovery.provider-incomplete",
                 "detail": "服务需要先启用，并填写地址与密钥后才能读取模型列表"}
     result = await model_discovery.discover(p.base_url, p.api_key, p.kind)
     existing = (await session.execute(
@@ -1322,9 +1470,11 @@ async def put_model_def(
     # Keep those exact rows editable; never truncate or rename their identities.
     if m is None and len(mid) > 64:
         raise HTTPException(status_code=400, detail="模型服务标识加模型标识共超过 64 个字符，请缩短模型标识")
-    if await session.get(ModelProvider, pid, populate_existing=True) is None:
+    provider = await session.get(ModelProvider, pid, populate_existing=True)
+    if provider is None:
         raise HTTPException(status_code=400, detail="这个模型服务不存在")
-    if m is None:
+    created = m is None
+    if created:
         m = ModelDef(id=mid, provider_id=pid, name=name, builtin=False)
         session.add(m)
     if "label" in body:
@@ -1348,6 +1498,9 @@ async def put_model_def(
         m.ctx_window = validate_limits(body.get("ctxWindow", m.ctx_window), m.config or {})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    receipt = {}
+    if created and model_catalog.normalize_modality(m.modality) == "chat":
+        receipt = await model_catalog.creation_receipt(session, provider, m)
     await session.commit()
     from ..services.client_domain_events import models_changed
     await models_changed(session)
@@ -1355,7 +1508,7 @@ async def put_model_def(
         session, user, "model.def", "setting", mid, m.label or name,
         {"enabled": m.enabled, "modality": m.modality},
     )
-    return {"ok": True, "id": mid}
+    return {"ok": True, "id": mid, **receipt}
 
 
 @router.delete("/model-defs/{mid:path}")
@@ -1836,9 +1989,14 @@ async def create_integration(body: IntegrationCreate,
                              user: User = Depends(require_perm("integration.manage")),
                              session: AsyncSession = Depends(get_session)):
     from ..services import scm_support
-    if str(body.type or "").strip().lower() == "gerrit":
-        raise HTTPException(status_code=400, detail=scm_support.GERRIT_RETIRED)
-    result = await agg.create_integration(session, body.name, body.type, body.config)
+    try:
+        result = await agg.create_integration(session, body.name, body.type, body.config)
+    except DuplicateName as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except scm_support.RetiredScmError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     await audit.log(session, user, "integration.create", "integration",
                     result.get("id"), result.get("name", ""),
                     {"type": result.get("type", "")})
@@ -1856,6 +2014,8 @@ async def update_integration(iid: str, body: IntegrationUpdate,
     try:
         r = await agg.update_integration(session, iid, enabled=body.enabled, config=body.config)
     except scm_support.RetiredScmError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if r is None:
         raise HTTPException(status_code=404, detail="集成不存在")
@@ -2098,6 +2258,8 @@ async def client_push(
         if forbidden:
             raise HTTPException(status_code=403,
                                 detail="本地模型配置由客户端管理，后台不能读取或修改")
+        from ..services import model_config_guard
+        await model_config_guard.personal(session, c, allow_patch=True)
         c.config = {**(c.config or {}), **patch}
         await session.commit()
         from ..services.client_domain_events import device_changed

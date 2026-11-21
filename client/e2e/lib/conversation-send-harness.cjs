@@ -35,6 +35,7 @@ async function install(win, read, extraScripts = []) {
     ChatChrome.header=()=>'';SessionMemoryEntry.options=()=>({});AccessControls.sync=()=>{};ChatWorkbench.render=()=>{};
     SoduWorkI18n.getLocale=()=> 'zh-CN';SoduWorkI18n.translateText=value=>value;
     SoduWorkI18n.t=(key,fallback,values={})=>String(fallback||key).replace(/\\{([^}]+)\\}/g,(_,name)=>values[name]??name);void 0;`);
+  await js(read('core/requirement-review-context.js') + '\nvoid 0;');
   const scripts = ['agent-brand', 'work-composer', 'conversation-attachments', 'panels-chat-work-actions', 'chat-dom-patch', 'panels-chat-tools',
     'chat-session-controls', 'chat-runtime-picker', 'chat-composer-controls', 'chat-task-start', 'chat-task-controller',
     'chat-context-meter', 'chat-scroll-follow', 'chat-markdown', 'chat-acceptance-results', 'chat-message-renderer',

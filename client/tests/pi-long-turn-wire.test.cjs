@@ -4,7 +4,7 @@ const fs = require('node:fs'), os = require('node:os'), path = require('node:pat
 const { pathToFileURL } = require('node:url');
 const config = require('../main/pi-session/model-config');
 
-test('real session completes 270 distinct writes without an implicit per-turn budget', { timeout: 60000 }, async t => {
+test('real session retains its model ticket across tool calls and completes 270 writes', { timeout: 60000 }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'soduwork-long-turn-'));
   const cwd = path.join(root, 'work'), agentDir = path.join(root, 'agent');
   fs.mkdirSync(cwd); fs.mkdirSync(agentDir);
@@ -14,6 +14,14 @@ test('real session completes 270 distinct writes without an implicit per-turn bu
     let raw = ''; req.on('data', part => raw += part); req.on('end', () => {
       captured.push(JSON.parse(raw));
       const first = requests++ === 0;
+      if (req.headers.authorization !== 'Bearer fixture') {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ detail: '模型凭据已变化，请重新选择模型后继续' }));
+        return;
+      }
+      // A background warmup or another session can replace the process-wide
+      // credential while this session is waiting for its tool results.
+      if (first) process.env.SODUWORK_PROXY_KEY = 'ticket-for-another-model';
       const delta = first ? { role: 'assistant', tool_calls: Array.from({ length: 270 }, (_, i) => ({
         index: i, id: 'write-' + i, type: 'function', function: { name: 'write',
           arguments: JSON.stringify({ path: path.join(cwd, i + '.txt'), content: 'output ' + i }) },

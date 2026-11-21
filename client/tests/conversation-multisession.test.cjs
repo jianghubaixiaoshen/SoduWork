@@ -170,7 +170,11 @@ test('opening a history chat paints an immediate placeholder instead of a blank 
   const ensureAt = enterBody.indexOf('await _ensure(chatId)');
   assert.ok(paintAt > 0 && ensureAt > paintAt, '占位必须画在 await _ensure 之前');
 
-  assert.match(opening, /ctx\._taskOpenError = reason;[\s\S]*ctx\._fail\('\\u6253\\u5f00\\u4e0d\\u4e86\\u5bf9\\u8bdd', reason\)/, 'history rejection must leave the loading placeholder');
+  assert.match(opening, /ctx\._taskOpenError = reason;[\s\S]*return failOpen\('\\u6253\\u5f00\\u4e0d\\u4e86\\u5bf9\\u8bdd', reason, \{code:'TASK_BINDING_MISMATCH'\}\)/,
+    'history binding rejection must enter the shared terminal failure path');
+  const failure=opening.slice(opening.indexOf('const failOpen ='),opening.indexOf('const api = ctx._api()'));
+  assert.match(failure,/openBlocked: true/,'a failed history open must block ordinary sends');
+  assert.match(failure,/ctx\._fail\(title, reason, null, failure\)/,'the terminal failure must repaint the opening placeholder as an error');
 });
 
 test('history sessions pass the extension watchdog options to the resource loader', () => {
@@ -372,8 +376,9 @@ test('a newly opened conversation stores the live ref before the first send', ()
   const openBody = chat.slice(openStart, openEnd);
   assert.match(openBody, /const openedRef = String\(got\.ref/);
   assert.match(openBody, /const openedSessionId = String\(got\.sessionId/);
-  assert.match(openBody, /(?:ctx\.)?_ref = openedRef;\s*(?:ctx\.)?_sessionId = openedSessionId;/);
-  assert.ok(openBody.indexOf('ctx._ref = openedRef') < openBody.indexOf('const activeRef = ctx._ref'),
+  const liveRefAt=openBody.indexOf('ctx._ref = openedRef;'),sessionIdAt=openBody.indexOf('ctx._sessionId = openedSessionId;');
+  assert.ok(liveRefAt>=0&&sessionIdAt>liveRefAt,'the validated live ref must be retained before the native session identity');
+  assert.ok(sessionIdAt < openBody.indexOf('const activeRef = ctx._ref'),
     'active event subscription must use the newly opened ref');
 });
 

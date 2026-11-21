@@ -183,7 +183,7 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
         catalog = image.model_catalog
         rows = [{'providerId': provider, 'name': 'same-name', 'config': {}} for provider in ('org', 'personal')]
         providers = {provider: {'id': provider, 'baseUrl': f'https://{provider}.test/v1',
-            'kind': 'openai-compat', 'apiKey': 'org-test-key'} for provider in ('org', 'personal')}
+            'kind': 'openai-compat', 'apiKey': 'org-test-key', 'personal': provider == 'personal'} for provider in ('org', 'personal')}
         client = SimpleNamespace(id='test-device', model_keys={'personal': 'personal-test-key'})
         with patch.object(catalog, 'usable', AsyncMock(return_value=rows)), \
                 patch.object(catalog, 'effective_provider_map', AsyncMock(return_value=providers)):
@@ -203,8 +203,9 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_http_transport_uses_image_endpoint_and_releases_capacity(self):
         from app.services import model_runtime, model_transport
+        from app.model_runtime_models import ModelRuntimeLease, ModelRuntimeMetric
         async with self.engine.begin() as connection:
-            for model in (models.AppSetting, models.ModelDef, models.ModelProvider):
+            for model in (models.AppSetting, models.ModelDef, models.ModelProvider, ModelRuntimeLease, ModelRuntimeMetric):
                 await connection.run_sync(model.__table__.create)
         seen, peers = [], []
         async def serve(reader, writer):

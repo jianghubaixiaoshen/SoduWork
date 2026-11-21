@@ -4,6 +4,8 @@
 import unittest
 import sqlite3
 import uuid
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from contextlib import closing
 from unittest.mock import AsyncMock, patch
 
@@ -85,6 +87,145 @@ class AcceptanceReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(value["canDecide"])
         self.assertEqual(before, len((await self.session.execute(select(am.ApprovalRequest))).scalars().all()))
         self.assertIsNone(self.task.reviewed_at)
+
+    async def test_requirement_timeline_preserves_order_full_notes_and_consumed_rework(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        notes = ["Old supplement " + "文" * 1800, "Returned changes " + "改" * 1100,
+                 "Newest supplement overrides the conflicting wording"]
+        self.task.note = "Current authoritative requirement"
+        self.task.updated_at = start + timedelta(days=30)
+        self.task.work_routing = {"reworkPending": {"feedback": "Mutable receipt must not become authority"}}
+        for index, (kind, note) in enumerate(zip(
+                ("execution.instructions", "release.rejected", "execution.instructions"), notes)):
+            self.session.add(models.TaskEvent(id="ordered-" + str(index), task_id=self.task.id,
+                kind=kind, at=start + timedelta(microseconds=index + 1), detail={
+                    "note": note, "action": "review", "privateRuntime": "must-not-enter-timeline"}))
+        self.session.add(models.TaskEvent(task_id=self.task.id, kind="release.rejected",
+            at=start + timedelta(seconds=1), detail={"action": "deploy", "note": "Not a business rework instruction"}))
+        await self.session.commit()
+        artifact = deepcopy(self.artifact.manifest)
+        context = await self.context()
+        timeline = context["requirementTimeline"]
+        self.assertTrue(timeline["executionContextIncluded"])
+        self.assertEqual([row["kind"] for row in timeline["rows"]], ["requirement", "supplement", "rework", "supplement"])
+        self.assertEqual([row["text"] for row in timeline["rows"][1:]], notes)
+        self.assertIsNone(timeline["rows"][0]["at"], "Task.updated_at is not a definition edit timestamp")
+        self.assertEqual([row["at"] for row in timeline["rows"][1:]],
+                         [(start + timedelta(microseconds=index + 1)).isoformat() for index in range(3)])
+        self.assertNotIn("privateRuntime", str(timeline))
+        self.assertNotIn("Mutable receipt", str(timeline))
+        self.assertEqual(timeline["revision"], context["requirementTimelineRevision"])
+        self.assertEqual((await self.context())["requirementTimelineRevision"], timeline["revision"])
+        self.assertEqual(self.artifact.manifest, artifact)
+        self.assertEqual([row["id"] for row in context["criteria"]], ["criterion-1", "criterion-2"])
+
+    async def test_assignment_alone_does_not_acquire_private_execution_instruction_history(self):
+        self.task.created_by = "another-user"
+        self.task.owner_client_id = "another-device"
+        self.task.requirement_content = {"title": "Public requirement", "note": "Public baseline"}
+        self.task.note = "Private execution context"
+        self.session.add(models.TaskEvent(task_id=self.task.id, kind="execution.instructions",
+            detail={"note": "Private supplement"}))
+        self.session.add(models.TaskEvent(task_id=self.task.id, kind="release.rejected",
+            detail={"action": "review", "note": "Private previous rework"}))
+        await self.session.commit()
+        with self.assertRaises(HTTPException) as caught:
+            await self.context()
+        self.assertEqual(caught.exception.status_code, 403)
+        from app.services import requirement_timeline
+        timeline = await requirement_timeline.packet(self.session, self.client, self.task)
+        self.assertFalse(timeline["executionContextIncluded"])
+        self.assertEqual(len(timeline["rows"]), 1)
+        self.assertIn("Public baseline", timeline["rows"][0]["text"])
+        self.assertNotIn("Private", str(timeline))
+
+    async def test_timeline_revision_rejects_changed_instructions_without_mutating_fixed_evidence(self):
+        context = await self.context()
+        body = {**self.body(), "requirementTimelineRevision": context["requirementTimelineRevision"]}
+        self.session.add(models.TaskEvent(task_id=self.task.id, kind="execution.instructions",
+            detail={"note": "A newly arranged clarification"}))
+        await self.session.commit()
+        artifact = deepcopy(self.artifact.manifest)
+        with self.assertRaises(HTTPException) as caught:
+            await api.auto_review_task_artifact(self.task.id, body, self.client, self.session)
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(self.request.status, "pending")
+        self.assertEqual(self.artifact.manifest, artifact)
+        self.assertEqual(len((await self.session.scalars(select(am.ApprovalDecision))).all()), 0)
+        body["requirementTimelineRevision"] = (await self.context())["requirementTimelineRevision"]
+        self.assertTrue((await api.auto_review_task_artifact(self.task.id, body, self.client, self.session))["closed"])
+
+    async def test_completed_rejection_retry_is_idempotent_after_its_feedback_changes_the_timeline(self):
+        body = {**self.body("reject"), "requirementTimelineRevision": (await self.context())["requirementTimelineRevision"]}
+        first = await api.auto_review_task_artifact(self.task.id, body, self.client, self.session)
+        self.assertEqual(first["verdict"], "rejected")
+        repeated = await api.auto_review_task_artifact(self.task.id, body, self.client, self.session)
+        self.assertTrue(repeated["already"])
+        self.assertEqual(len((await self.session.scalars(select(am.ApprovalDecision))).all()), 1)
+
+    async def test_saved_definition_creation_and_edit_have_real_times_without_using_execution_metadata(self):
+        from app.services import requirement_timeline, tasks
+        created = await tasks.create_task(self.session, self.client.id,
+            {"title": "A new requirement", "note": "Original business requirement", "status": "todo"})
+        task = await self.session.get(models.Task, created["id"])
+        first = await requirement_timeline.packet(self.session, self.client, task)
+        self.assertIsNotNone(first["rows"][0]["at"])
+        await tasks.update_task(self.session, self.client.id, task.id,
+            {"priority": "high", "tags": ["metadata"], "requirementVersion": task.requirement_version})
+        metadata = await requirement_timeline.packet(self.session, self.client, task)
+        self.assertEqual(metadata["rows"][0]["at"], first["rows"][0]["at"],
+                         "Metadata versions retain the actual earlier definition time")
+        self.session.add(models.TaskEvent(task_id=task.id, kind="execution.instructions",
+            detail={"note": "Earlier supplementary instruction"}))
+        await self.session.commit()
+        changed = await tasks.update_task(self.session, self.client.id, task.id,
+            {"note": "The latest edited business requirement", "requirementVersion": task.requirement_version})
+        self.assertIsNotNone(changed)
+        packet = await requirement_timeline.packet(self.session, self.client, task)
+        self.assertEqual([row["kind"] for row in packet["rows"]], ["supplement", "requirement"])
+        self.assertIn("latest edited", packet["rows"][-1]["text"])
+        self.assertIsNotNone(packet["rows"][-1]["at"])
+        await tasks.update_task(self.session, self.client.id, task.id,
+            {"acceptanceCriteria": ["The latest definition criterion"], "requirementVersion": task.requirement_version})
+        criteria = next(row for row in (await requirement_timeline.packet(self.session, self.client, task))["rows"]
+                        if row["kind"] == "requirement")
+        self.assertIn("The latest definition criterion", criteria["text"])
+        self.assertIsNotNone(criteria["at"])
+        # A body returning to an older value without a matching version receipt is not proof of its edit time.
+        task.note = "Original business requirement"
+        task.requirement_version += 1
+        await self.session.commit()
+        unknown = next(row for row in (await requirement_timeline.packet(self.session, self.client, task))["rows"]
+                       if row["kind"] == "requirement")
+        self.assertIsNone(unknown["at"])
+
+    async def test_definition_receipts_keep_only_public_business_content_and_shared_edits(self):
+        from app.services import requirement_timeline, task_requirements
+        task = models.Task(id="public-definition", title="Private execution title", note="Private execution notes",
+            status="todo", created_by=self.actor.id, owner_client_id="different-device",
+            requirement_content={"title": "Public requirement", "note": "Public original"}, requirement_version=1)
+        self.session.add(task)
+        await self.session.flush()
+        await requirement_timeline.record_definition(self.session, task)
+        await self.session.commit()
+        await task_requirements.update_shared(self.session, self.client, task,
+            {"note": "Public edited requirement", "requirementVersion": 1})
+        events = (await self.session.scalars(select(models.TaskEvent).where(
+            models.TaskEvent.task_id == task.id, models.TaskEvent.kind == requirement_timeline.DEFINITION))).all()
+        self.assertEqual(len(events), 2)
+        self.assertNotIn("Private execution", str([event.detail for event in events]))
+        timeline = await requirement_timeline.packet(self.session, self.client, task)
+        self.assertIn("Public edited", timeline["rows"][0]["text"])
+        self.assertIsNotNone(timeline["rows"][0]["at"])
+
+    async def test_malformed_timeline_revision_never_writes_an_approval(self):
+        for revision in (None, "", "not-a-revision", {"revision": "0" * 64}):
+            with self.assertRaises(HTTPException) as caught:
+                await api.auto_review_task_artifact(self.task.id,
+                    {**self.body(), "requirementTimelineRevision": revision}, self.client, self.session)
+            self.assertEqual(caught.exception.status_code, 422)
+        self.assertEqual(self.request.status, "pending")
+        self.assertEqual(len((await self.session.scalars(select(am.ApprovalDecision))).all()), 0)
 
     async def test_direct_creator_context_does_not_create_ticket(self):
         await self.session.delete(self.request)

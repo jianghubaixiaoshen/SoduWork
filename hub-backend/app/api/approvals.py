@@ -2,7 +2,9 @@
 from __future__ import annotations
 import uuid
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
+from typing import Annotated
+
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -67,13 +69,14 @@ async def _item(session: AsyncSession, request: am.ApprovalRequest,
 
 
 @router.get("")
-async def inbox(view: str = "pending", limit: int = 60,
+async def inbox(view: str = "pending", limit: Annotated[int, Query(ge=1)] = 60,
                 client: Client = Depends(current_client),
-                session: AsyncSession = Depends(get_session)):
+                session: AsyncSession = Depends(get_session),
+                offset: Annotated[int, Query(ge=0, le=2**63-1)] = 0):
     """Return this user's pending queue or their own immutable decision history."""
     user = await _actor(session, client)
     view = "done" if str(view).lower() == "done" else "pending"
-    limit = min(100, max(1, int(limit or 60)))
+    limit = min(100, limit)
     request_ids = set((await session.execute(select(am.ApprovalAssignment.request_id).where(
         am.ApprovalAssignment.user_id == user.id
     ))).scalars().all())
@@ -108,12 +111,12 @@ async def inbox(view: str = "pending", limit: int = 60,
             .join(am.ApprovalDecision,
                   am.ApprovalDecision.request_id == am.ApprovalRequest.id)
             .where(am.ApprovalDecision.user_id == user.id)
-            .order_by(am.ApprovalDecision.created_at.desc())
-            .limit(limit)
+            .order_by(am.ApprovalDecision.created_at.desc(), am.ApprovalDecision.id)
+            .offset(offset).limit(limit)
         )).all())
     my_decisions = {request.id: decision for request, decision in done_pairs}
     rows = ([request for request, _ in done_pairs]
-            if view == "done" else pending[:limit])
+            if view == "done" else pending[offset:offset + limit])
     task_ids = {row.task_id for row in rows}
     artifact_ids = {row.artifact_version_id for row in rows}
     tasks = {row.id: row for row in (await session.execute(select(Task).where(
@@ -414,10 +417,11 @@ async def decide(request_id: str, body: dict = Body(default_factory=dict),
         session, task, request.id, note,
         body.get("reworkAttachmentIds") if decision == "reject" else [],
     )
+    deploy_vote = decision == "approve" and request.action == "deploy"
     out = await release_control.decide(
         session, task, user, action=request.action, decision=decision, note=rework_note,
         artifact_version_id=request.artifact_version_id,
-        environment_id=request.environment_id,
+        environment_id=request.environment_id, commit=not deploy_vote,
     )
     if not out.get("ok"):
         raise _decision_error(out)
@@ -443,9 +447,17 @@ async def decide(request_id: str, body: dict = Body(default_factory=dict),
     # Direct AI tasks and plugin nodes share the idempotent rework service.
     if decision == "approve" and request.action == "merge":
         execution = await code_delivery.merge_approved(session, task, who=who)
-    elif decision == "approve" and request.action == "deploy":
-        execution = await deployments.request_environment(
-            session, task, request.environment_id, who)
+    elif deploy_vote:
+        if out["request"]["status"] == "pending":
+            await session.commit()
+            execution = {"ok": True, "pendingApproval": True, "request": out["request"], "runs": []}
+        else:
+            # The final vote and its queued runs share the task lock and commit.
+            execution = await deployments.request_environment(
+                session, task, request.environment_id, who)
+            if not execution["ok"]:
+                await session.rollback()
+                raise HTTPException(status_code=409, detail=execution["error"])
     elif decision == "approve" and request.action == "uat":
         execution = await deployments.continue_after_acceptance(
             session, task, request.environment_id, who)
@@ -517,7 +529,8 @@ async def revoke(request_id: str, body: dict = Body(default_factory=dict),
     out = await release_control.revoke_approval(
         session, task, user, request_id, note=str(body.get("note") or ""))
     if not out.get("ok"):
-        raise HTTPException(status_code=409, detail=out.get("error") or "撤回没有成功")
+        status = 403 if out.get("reason") == "forbidden" else 409
+        raise HTTPException(status_code=status, detail=out.get("error") or "撤回没有成功")
     who = user.display_name or user.username
     owner = await session.get(Client, task.owner_client_id) if task.owner_client_id else None
     if owner and task_access.is_owner(task, owner) and owner.id != client.id:

@@ -25,7 +25,7 @@ app.on('window-all-closed', () => {});
 const report = { ok: false, cases: [], errors: [], networkRequests: [],
   platform: process.platform, electron: process.versions.electron,
   boundary: 'Real Electron/Chromium, production Agent drawer/API, local model secure stores, renderer IPC and local-agent-probe. Hub inventory/jobs and Runner RPC receipts are synthetic. No real account, provider request, installed-runtime execution or installation changes.' };
-const managed = ['pi', 'qwen', 'opencode', 'dsh', 'kimi', 'harness2', 'codex-harness'];
+const managed = ['pi', 'qwen', 'opencode', 'dsh', 'kimi', 'codex-harness'];
 const scope = { hub: 'http://fixture-hub.invalid:8989', clientId: 'fixture-device', owner: 'fixture-owner' };
 const provider = { id: 'private-fixture', name: 'Private fixture', baseUrl: 'http://model-fixture.invalid/v1', authMode: 'none' };
 const model = { providerId: provider.id, name: 'private-wire-one', label: 'Private model one' };
@@ -58,7 +58,7 @@ async function screenshot(name) {
   fs.writeFileSync(path.join(out, name + '.png'), (await win.webContents.capturePage(undefined,
     { stayHidden: true, stayAwake: true })).toPNG());
 }
-async function reload() { await js('_agLoad(true)'); await until('document.querySelectorAll(".ag-row").length===9'); }
+async function reload() { await js('_agLoad(true)'); await until('document.querySelectorAll(".ag-row").length===7'); }
 function mark(name) { report.cases.push(name); console.log('[agent-single-model] PASS ' + name); }
 
 app.whenReady().then(async () => {
@@ -133,7 +133,7 @@ app.whenReady().then(async () => {
       let value;
       if(route.endsWith('/runners'))value={runners:[runner]};
       else if(route.endsWith('/agent-setup'))value={models:hubModels,modelCount:hubModels.length,machines:[{
-        ...runner,env:{ok:true,node:'fixture',npm:'fixture'},agents:[...managedKeys,'codex','claude'].map(key=>({
+        ...runner,env:{ok:true,node:'fixture',npm:'fixture'},agents:[...managedKeys,'codex'].map(key=>({
           key,name:key==='dsh'?'DeepSeek Harness':key,installed:true,present:true,state:'ready',setupState:'ready',
           modelPick:managedKeys.includes(key),model:'',modelEffective:hubModels[0]?.name||'',...hubOverrides[key]}))}]};
       else if(route.endsWith('/agent-setup/probe')){
@@ -148,7 +148,7 @@ app.whenReady().then(async () => {
   for (const file of scripts) await js(fs.readFileSync(path.join(client, file), 'utf8') + '\nvoid 0;');
   await js('SoduWorkAPI.registerClient()');
   await js('openAgentsPanel();void 0;');
-  await until('document.querySelectorAll(".ag-row").length===9&&_agData.localModelCount===1');
+  await until('document.querySelectorAll(".ag-row").length===7&&_agData.localModelCount===1');
   for (const key of managed) {
     await drawer(key);
     assert.equal(await js('document.querySelector(".ag-drawer [data-amodel]").value'), localRef);
@@ -164,13 +164,13 @@ app.whenReady().then(async () => {
   assert.deepEqual(defaults.get(scope), initialDefault, 'Automatic selection must not persist a preference');
   assert.equal(fs.existsSync(path.join(profile, 'agent-models.secure.json')), false);
   await screenshot('single-local-probe');
-  mark('Seven managed drawers select the sole local model; clicking DeepSeek probe reaches real IPC and the private probe path without saving defaults');
-  for (const key of ['codex', 'claude']) {
+  mark('Six managed drawers select the sole local model; clicking DeepSeek probe reaches real IPC and the private probe path without saving defaults');
+  for (const key of ['codex']) {
     await drawer(key);
     assert.equal(await js('document.querySelectorAll(".ag-drawer [data-amodel]").length'), 0);
     assert.match(await js('document.querySelector(".ag-drawer .ag-model").textContent'), /自己的账号与模型/);
   }
-  mark('Codex and Claude retain their own accounts without managed model selectors');
+  mark('Codex retains its own account without managed model selectors');
 
   const multiple = models.save({ models: [model, other] });
   const otherRef = multiple.myModels.find(row => row.name === other.name).id;

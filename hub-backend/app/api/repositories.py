@@ -8,12 +8,15 @@ from ..deps import require_perm
 from ..models import User
 from ..services import audit, rbac, repository_catalog as catalog
 from ..services.resource_leases import LeaseBusy as resource_busy
+from ..services.workdirs import InvalidRepositoryDirectory
 
 router = APIRouter(prefix="/api/v1/admin", tags=["repository-catalog"])
 
 
 def _conflict(exc: Exception) -> HTTPException:
-    return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=400 if isinstance(
+        exc, (InvalidRepositoryDirectory, catalog.InvalidRepositoryInput)) else 409,
+                         detail=str(exc))
 
 
 async def _scope(session: AsyncSession, user: User) -> set[str] | None:
@@ -73,6 +76,12 @@ async def list_repository_catalog(
         session, scope=await _scope(session, user),
         integration_id=integrationId, search=search,
         include_inactive=includeInactive)}
+
+
+@router.get("/integrations/{integration_id}/repositories/sync",
+            dependencies=[Depends(require_perm("integration.manage"))])
+async def repository_sync_status(integration_id: str, session: AsyncSession = Depends(get_session)):
+    return {"stage": await catalog.sync_stage(session, integration_id)}
 
 
 @router.post("/integrations/{integration_id}/repositories/sync")

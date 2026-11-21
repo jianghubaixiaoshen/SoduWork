@@ -9,8 +9,28 @@
   }
   function render(request, escape, options = {}) {
     const esc = escape;
+    const attribute = source => esc(global.SoduWorkI18n?.t ? global.SoduWorkI18n.t(source) : source);
     const text = source => global.SoduWorkI18n?.html ? global.SoduWorkI18n.html(source, source)
       : esc(global.SoduWorkI18n?.t ? global.SoduWorkI18n.t(source) : source);
+    if (request.action === 'native.question') {
+      const choices = Array.isArray(request.options) && request.options.length <= 64 && request.options.every(item =>
+        item && typeof item.optionId === 'string' && item.optionId.length > 0 && item.optionId.length <= 1024 &&
+        typeof item.name === 'string' && item.name.trim() && item.name.length <= 4000 &&
+        ['allow_once', 'reject_once'].includes(item.kind)) &&
+        new Set(request.options.map(item => item.optionId)).size === request.options.length ? request.options : [];
+      const button = (decision, label, optionId) => '<button type="button" class="nask-btn" data-ui-answer="permission"' +
+        ' data-ui-value="' + decision + '" data-permission-request="' + esc(request.requestId) +
+        '" data-permission-revision="' + Number(request.policyRevision) + '"' +
+        (optionId === undefined ? '' : ' data-permission-option="' + esc(optionId) + '" data-user-content') + '>' + label + '</button>';
+      return '<section class="access-request access-question" role="dialog" aria-modal="true" aria-label="' + attribute('请选择') +
+        '" data-permission-ref="' + esc(options.ref || '') + '"><header class="access-head" aria-live="polite">' +
+        '<div><b>' + text('请选择') + '</b></div><span class="access-count" role="status"></span></header>' +
+        '<div class="access-body"><p class="access-target" data-user-content>' + esc(request.title || '') + '</p>' +
+        '<div class="nask-btns access-question-options" role="group" aria-label="' + attribute('请选择') + '">' +
+        choices.map(item => button('answer', esc(item.name), item.optionId)).join('') + '</div></div>' +
+        '<footer><div class="nask-btns">' + button('deny', text('取消')) +
+        '</div><p class="access-error" role="alert" hidden></p></footer></section>';
+    }
     const titles = { 'file.read': '允许读取文件？', 'file.write': '允许修改文件？', 'command.execute': '允许运行命令？', 'tool.execute': '允许使用此工具？' };
     const targetLabels = { 'file.read': '文件位置', 'file.write': '文件位置', 'command.execute': '将运行的命令' };
     const payload = clean(request.arguments || {});
@@ -42,7 +62,7 @@
       (request.tool || request.agent ? '<code data-user-content>' + esc(request.tool || request.agent) + '</code>' : '') +
       '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4"/></svg></summary><pre data-user-content>' + esc(detail.slice(0, 20000)) + '</pre></details>' : '') +
       '</div>' +
-      '<footer><div class="nask-btns" role="group" aria-label="' + text('权限确认') + '">' + button('deny', '拒绝') + button('once', '允许一次') +
+      '<footer><div class="nask-btns" role="group" aria-label="' + attribute('权限确认') + '">' + button('deny', '拒绝') + button('once', '允许一次') +
       (Number.isInteger(options.fullRevision) ? button('full', '始终允许', 'access-full') : '') + '</div>' +
       '<small>' + scopeNote + '</small><p class="access-error" role="alert" hidden></p></footer></section>';
   }
@@ -94,7 +114,7 @@
     const focusDialog = () => {
       const active = document.activeElement;
       if (state.layer.contains(active)) return;
-      focusables()[0]?.focus({ preventScroll: true });
+      (state.layer.querySelector('[data-ui-value="deny"]') || focusables()[0])?.focus({ preventScroll: true });
     };
     const blockDock = blocked => {
       const dock = state.dock;
@@ -149,7 +169,7 @@
       snapshot.accessControl.modes?.includes('full') && policy?.mode !== 'full' && Number.isInteger(policy?.revision)
       ? policy.revision : undefined;
     const key = JSON.stringify([ref, request.requestId, request.policyRevision, request.action, request.tool,
-      request.agent, request.target, request.arguments, request.allowSession, request.sessionScope, fullRevision]);
+      request.agent, request.target, request.arguments, request.title, request.options, request.allowSession, request.sessionScope, fullRevision]);
     if (state.key !== key) {
       state.layer.innerHTML = render(request, escape, { ref, fullRevision }); state.key = key;
     }
@@ -177,6 +197,7 @@
     if (card.dataset.permissionRef && card.dataset.permissionRef !== ref) return { ok: false, reason: '权限请求已失效' };
     const response = { requestId: button.dataset.permissionRequest,
       policyRevision: Number(button.dataset.permissionRevision), decision: button.dataset.uiValue };
+    if (response.decision === 'answer') response.optionId = button.dataset.permissionOption;
     const buttons = [...card.querySelectorAll('[data-ui-answer]')];
     const error = card.querySelector('.access-error');
     card.dataset.answerPending = 'true'; card.setAttribute('aria-busy', 'true');

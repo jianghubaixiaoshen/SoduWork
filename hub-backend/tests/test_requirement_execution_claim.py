@@ -16,6 +16,32 @@ class RequirementExecutionClaimTests(unittest.IsolatedAsyncioTestCase):
     asyncTearDown = UnifiedRequirementTests.asyncTearDown
     call = UnifiedRequirementTests.call
 
+    async def test_created_definition_time_survives_claim_execution_and_acceptance_context(self):
+        from app.services import requirement_timeline
+        created = await self.call("POST", "tasks", "owner", json={
+            "title": "Created on the original device", "note": "A saved business requirement",
+            "assigneeUserId": "peer", "acceptanceCriteria": ["Verify the result"]})
+        self.assertEqual(created.status_code, 200, created.text)
+        task_id = created.json()["id"]
+        async with self.sessions() as session:
+            task = await session.get(models.Task, task_id)
+            owner = await session.get(models.Client, "owner")
+            original = await requirement_timeline.packet(session, owner, task)
+            saved_at = original["rows"][0]["at"]
+            self.assertIsNotNone(saved_at)
+        claimed = await self.call("POST", "tasks/" + task_id + "/prepare-execution", "peer", json={})
+        self.assertEqual(claimed.status_code, 200, claimed.text)
+        for action in ("prepare", "start", "complete"):
+            turn = await self.call("POST", "tasks/" + task_id + "/conversation-turn", "peer", json={
+                "action": action, "conversationId": "claimed-conversation", "turnId": "claimed-turn", "executor": "native"})
+            self.assertEqual(turn.status_code, 200, turn.text)
+        submitted = await self.call("POST", "tasks/" + task_id + "/submit-review", "peer", json={})
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        context = await self.call("GET", "tasks/" + task_id + "/acceptance-context", "owner")
+        self.assertEqual(context.status_code, 200, context.text)
+        baseline = next(row for row in context.json()["requirementTimeline"]["rows"] if row["kind"] == "requirement")
+        self.assertEqual(baseline["at"], saved_at, "Claim time must never replace the business definition time")
+
     async def test_pending_owner_start_serializes_with_assignee_claim_on_file_sqlite(self):
         import asyncio
         from pathlib import Path

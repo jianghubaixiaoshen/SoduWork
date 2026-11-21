@@ -51,12 +51,11 @@ with tempfile.TemporaryDirectory(prefix="soduwork-misplaced-smoke-") as temporar
     misplaced.write_text("raise AssertionError('must be registered')", encoding="utf-8")
     check("top-level smoke files cannot silently bypass registration",
           any("must live in smoke/" in error for error in audit_manifest(Path(temporary))))
-check("Harness2 and requirement maintenance regressions stay in the offline release gate",
-      {"test_harness2_regressions.py", "test_requirement_review_access.py",
+check("Runtime retirement and requirement maintenance regressions stay in the offline release gate",
+      {"test_retired_agents.py", "test_requirement_review_access.py",
        "test_requirement_maintenance.py", "test_requirement_maintenance_policy.py",
        "test_handoff_maintenance_boundary.py", "test_notice_audience_regression.py",
-       "test_darwin_process_tree.py", "test_harness2_engine.py",
-       "test_harness2_lifecycle.py", "test_harness2_platforms.py",
+       "test_darwin_process_tree.py",
        "test_managed_agent_download.py", "test_opencode_runtime_config.py"}
       <= set(RELEASE_SMOKES))
 import unittest

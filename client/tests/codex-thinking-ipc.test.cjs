@@ -13,13 +13,18 @@ function fixture(t) {
   identity.session = Buffer.from(JSON.stringify({ typ: 'device', uid: 'owner', cid: 'device',
     iat: now - 10, exp: now + 3600 })).toString('base64url') + '.' + 'a'.repeat(64);
   const handle = current = { sessionId: 'chat', adapterId: 'codex',
+    selectAgent: async (agent, selection) => { calls.push(['agent', agent, selection]); return { ok: true }; },
+    snapshot: () => ({ status: 'idle' }),
     setThinkingLevel: async level => { calls.push(['level', level]); return { ok: true, thinking: { level } }; },
     setThinkingMode: enabled => { calls.push(['boolean', enabled]); return { ok: true }; } };
   install({ app: {}, ipcMain: { handle: (id, action) => handlers.set(id, action) },
     session: { get: () => current }, identityOf: async () => online ? identity : null,
     memories: { assertOwner() { if (!owned) throw Error('Another account'); } },
-    cloud: { guard: () => cloud } });
+    cloud: { guard: () => cloud, selectExecution: async (_handle, choice) => {
+      calls.push(['cloud', choice]); return { ok: true };
+    } }, publish() {} });
   return { handle, calls, send: value => handlers.get('pi-session-set-thinking')({}, 'chat', value),
+    select: (agent, choice) => handlers.get('pi-session-select-agent')({}, 'chat', agent, choice),
     trust: value => { trusted = value; }, login: value => { online = value; },
     cloud: value => { cloud = value; }, owner: value => { owned = value; }, close: () => { current = null; } };
 }
@@ -48,4 +53,24 @@ test('cloud and other adapters cannot mutate a local Codex effort setting', asyn
   assert.deepEqual(f.calls, []);
   assert.equal((await f.send(true)).ok, true);
   assert.deepEqual(f.calls, [['boolean', true]]);
+});
+
+test('Agent selection forwards only the explicit model choice and keeps authorization inside main', async t => {
+  const f = fixture(t);
+  assert.equal((await f.select('qwen', { modelName: 'chosen-model', identity: 'untrusted', allowLocal: true })).ok, true);
+  const selection = f.calls[0][2];
+  assert.equal(selection.modelName, 'chosen-model');
+  assert.notEqual(selection.identity, 'untrusted');
+  assert.equal(typeof selection.validate, 'function');
+  assert.equal(selection.allowLocal, undefined);
+});
+
+test('cloud Agent selection rejects device model references before any selection or remote request', async t => {
+  const f = fixture(t); f.cloud(true);
+  for (const modelName of ['local:model-private', '  local:model-private  ', 'image::device:provider::local:model-private']) {
+    assert.equal((await f.select('claude', { modelName })).ok, false);
+    assert.deepEqual(f.calls, []);
+  }
+  assert.equal((await f.select('qwen', { modelName: 'hub-model' })).ok, true);
+  assert.deepEqual(f.calls, [['cloud', { agentId: 'qwen', modelName: 'hub-model' }]]);
 });

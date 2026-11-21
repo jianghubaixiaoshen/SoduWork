@@ -423,8 +423,8 @@ async def request_environment(session: AsyncSession, task: models.Task, env_id: 
                                                     {"summary": f"发布到{env.name}",
                                                      "commit": artifact.commit_sha,
                                                      "approvalPolicyId": env.approval_policy_id})
-        await session.commit()
         if req.status != "approved":
+            await session.commit()
             return {"ok": True, "pendingApproval": True,
                     "request": release_control.request_api(req), "runs": []}
 

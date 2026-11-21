@@ -4,6 +4,7 @@ const contextWindow = require('./context-window');
 const thinkingCapabilities = require('./thinking-capabilities');
 const { replaceFileSync } = require('../verified-file-replace.cjs');
 const localPrivacy = require('../pi-session/local-model-runtime-privacy.cjs');
+const { DEFAULT_OUTPUT_TOKENS } = require('../model-capability-contract.cjs');
 
 function canonicalName(name, model) {
   if (model?.localOnly) {
@@ -16,12 +17,6 @@ function canonicalName(name, model) {
   if (!canonical) throw new Error('Local model reference is unavailable');
   return canonical;
 }
-
-// The previous fallback (16k/32k) was routinely consumed by hidden reasoning on
-// coding models before they emitted a tool call or a final answer. Keep an
-// explicit server supplied limit authoritative, but give models with missing
-// metadata a usable default. This is still bounded by the model context below.
-const DEFAULT_OUTPUT_TOKENS = 65536;
 
 function publicModel(model) {
   const m = model || {};
@@ -132,10 +127,12 @@ function preference(app, ref) {
 }
 
 function piProvider(next) {
+  require('../model-capability-contract.cjs').assertRequired(next, ['streaming']);
   const thinking = thinkingCapabilities.profile(next);
   const localNoAuth = next?.localOnly === true && !String(next?.key || '').trim();
   const compat = {
     supportsDeveloperRole: false,
+    ...require('../model-capability-contract.cjs').piCompatibility(next),
     supportsReasoningEffort: thinking.supportsReasoningEffort,
     ...(thinking.format ? { thinkingFormat: thinking.format } : {}),
   };

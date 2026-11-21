@@ -85,7 +85,7 @@ async def _packet(session, task, artifact, request):
 
 
 async def context(session, client, tid):
-    from . import tasks
+    from . import requirement_timeline, tasks
     task, actor = await _identity(session, client, tid)
     artifact, request = await _subject(session, task)
     allowed = await _allowed(session, task, request, actor, artifact)
@@ -105,6 +105,7 @@ async def context(session, client, tid):
     if len(selected) >= 2:
         bundle = {"filename": delivery_bundle.archive_filename(task.title), "artifactVersionId": artifact.id,
                   "attachmentIds": [row.id for row in selected], "fileCount": len(selected)}
+    timeline = await requirement_timeline.packet(session, client, task)
     return {"task": await tasks.task_to_api_live(session, task),
             "approvalId": request.id if request else "direct:" + task.id,
             "artifactVersionId": artifact.id, "requirementVersion": task.requirement_version,
@@ -115,6 +116,7 @@ async def context(session, client, tid):
             "optionalAttachments": [attachment_to_api(row) for row in optional],
             "attachmentIds": [row.id for row in selected],
             "deliveryBundle": bundle,
+            "requirementTimeline": timeline, "requirementTimelineRevision": timeline["revision"],
             "canDecide": allowed and (request is None or request.status == "pending"),
             "acceptanceOnly": True}
 
@@ -197,7 +199,10 @@ async def _apply(session, client, tid, body):
                     "closed": request.status == "approved" and bool(task.reviewed_at) and task.status == "done"}
         if request.status != "pending":
             raise HTTPException(409, "这项验收已由其他人处理，请刷新")
-    else:
+    if "requirementTimelineRevision" in body:
+        from . import requirement_timeline
+        await requirement_timeline.verify(session, client, task, body["requirementTimelineRevision"])
+    if request is None:
         # Reuse the manual acceptance policy without letting creator identity bypass separation of duties.
         request = await release_control.ensure_request(session, task, artifact, "review",
             context={"acceptanceCriteria": task.acceptance_criteria or []})

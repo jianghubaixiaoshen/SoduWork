@@ -248,7 +248,10 @@ async function open(opts) {
     ]);
     _openTiming('runtime-prepared', openStarted);
     runtime = prepared[0];
-    if (prep.model.localOnly) runtime.registerProvider(prep.provider,
+    // Bind the ticket to this runtime before its first request. A model
+    // warmup in the same worker can replace the environment variable used
+    // by models.json between a tool call and the next model request.
+    runtime.registerProvider(prep.provider,
       require('../conversation/model-selection').piProvider(prep.model));
     model = configureLocalTransport(runtime.getModel(prep.provider, prep.model.id), prep.model);
     if (!model) {
@@ -282,6 +285,8 @@ async function open(opts) {
     args.customTools = [prepared[1],
       require('./vision-read-tool').create(sdk, args.cwd, identity, () => prep.model)];
     created = await require('./background-process').run(() => sdk.createAgentSession(args));
+    require('../access-control/pi-tool-selection').restore(created.session, sdk,
+      resources.settingsManager, effectiveCwd, accessPolicy);
     _openTiming('agent-created', openStarted);
   } catch (e) {
     return { ok: false, reason: '起会话失败：' + String((e && e.message) || e) };
@@ -408,6 +413,8 @@ async function open(opts) {
           require('./vision-read-tool').create(sdk, effectiveCwd, identity, () => prep.model)],
       }));
       try {
+        require('../access-control/pi-tool-selection').restore(next.session, sdk,
+          nextResources.settingsManager, effectiveCwd, policy, accessPolicy);
         await initializeExtensions(next.session, nextResources);
         return { session: next.session, resources: nextResources };
       } catch (error) { next.session.dispose(); throw error; }
@@ -417,7 +424,7 @@ async function open(opts) {
       piSession = next.session; access = next.access; accessPolicy = next.policy;
       resources = next.resources; opts.readOnly = accessPolicy.mode === 'readonly';
       opts.accessPolicy = accessPolicy;
-      unsub = piSession.subscribe(onPiEvent);
+      unsub = require('./model-request-phase.cjs').subscribe(piSession, onPiEvent);
       _rawPromptComplete = outputContinuation.bind(piSession, acc, () => Boolean(run.stopReason) || liveAccess.changing() || turnQueue.active()?.stopRequested || closed, _emit);
     },
   });
@@ -438,7 +445,7 @@ async function open(opts) {
       if (!refreshed.ok) throw new Error(refreshed.reason || '模型会话凭据刷新失败');
     },
   });
-  let failedLastTurn = false;
+  let failedLastTurn = opts.retainedExecutionFailure === true;
   let skillSelectionFailure = null;
   const storedQuality = restoredQuality || (goal.intent === 'goal'
     ? goalQuality.fromEntries(piSession.sessionManager.getEntries()) : null);
@@ -603,7 +610,7 @@ async function open(opts) {
 
 
   // Contain subscription exceptions because they propagate through the runtime event loop.
-  let unsub = piSession.subscribe(onPiEvent);
+  let unsub = require('./model-request-phase.cjs').subscribe(piSession, onPiEvent);
 
   let _rawPromptComplete = outputContinuation.bind(
     piSession, acc, () => Boolean(run.stopReason) || liveAccess.changing() || turnQueue.active()?.stopRequested || closed, _emit);
@@ -627,6 +634,8 @@ async function open(opts) {
           require('./vision-read-tool').create(sdk, effectiveCwd, identity, () => prep.model)],
       }));
       try {
+        require('../access-control/pi-tool-selection').restore(next.session, sdk,
+          nextResources.settingsManager, effectiveCwd, previous.policy);
         const nextAccess = require('../access-control/pi').install(next.session, previous.policy, effectiveCwd, accessChanged, { readScope });
         try {
           await initializeExtensions(next.session, nextResources);
@@ -637,7 +646,7 @@ async function open(opts) {
     commit(next) {
       unsub(); piSession = next.session; access = next.access; resources = next.resources;
       opts.noExtensions = false;
-      unsub = piSession.subscribe(onPiEvent);
+      unsub = require('./model-request-phase.cjs').subscribe(piSession, onPiEvent);
       _rawPromptComplete = outputContinuation.bind(piSession, acc, () => Boolean(run.stopReason) || liveAccess.changing() || turnQueue.active()?.stopRequested || closed, _emit);
     },
   });
@@ -646,7 +655,9 @@ async function open(opts) {
     _openTiming('prompt-start', openStarted);
     return runControl.promptComplete(run,
       (value, config) => require('./background-process').run(() =>
-        liveAccess.run(() => _rawPromptComplete(value, config)),
+        liveAccess.run(() => options?.pluginRepair
+          ? piSession.sendCustomMessage({ customType: 'soduwork.plugin.repair', display: false, content: value }, { triggerTurn: true })
+          : _rawPromptComplete(value, config)),
         { desktopScope: desktopControlScope }), prompt, options)
       .finally(() => _openTiming('prompt-end', openStarted));
   };

@@ -35,7 +35,7 @@ async function mount(t, { permissions = ['identity.manage', 'task.view'], active
     for (const [key, descriptor] of descriptors) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key] }
   })
   const buttons = () => page.nodes(node => node.type === 'button' && String(node.props.className).startsWith('nav-item'))
-  const account = () => buttons().find(node => node.props.children[1].props.children === '账户与安全')
+  const account = () => buttons().find(node => node.props.children[1].props.children === '邮件与协议设置')
   const screen = () => page.nodes(node => node.props.className === 'app')[0].props['data-screen']
   const legal = () => buttons().find(node => node.props.children[1].props.children === '协议与隐私政策')
   return { page, account, legal, screen, values, events }

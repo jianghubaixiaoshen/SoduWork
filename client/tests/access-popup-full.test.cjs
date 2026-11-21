@@ -9,7 +9,7 @@ function fixture(decision = 'full') {
     setAttribute() {}, querySelector: () => error, querySelectorAll: () => [button] };
   const button = { dataset: { uiValue: decision, permissionRequest: 'request-a', permissionRevision: '2', accessRevision: '3' },
     disabled: false, closest: () => card, getBoundingClientRect: () => ({ left: 5, top: 8, width: 60, height: 30 }) };
-  return { controls: window.AccessControls, button, card, error };
+  return { window, controls: window.AccessControls, button, card, error };
 }
 test('command approval offers three decisions and no session-grant entry', () => {
   const f = fixture(); const request = { requestId: 'command-a', policyRevision: 2,
@@ -59,4 +59,49 @@ test('allow once still sends the exact pending request and does not change sessi
     setAccessMode() { assert.fail('ordinary reply must not escalate'); } }, 'chat-a');
   assert.equal(received.ref, 'chat-a'); assert.equal(received.decision, 'once');
   assert.equal(received.requestId, 'request-a'); assert.equal(received.policyRevision, 2);
+});
+
+test('questions present each opaque choice and cancellation without permission grants', () => {
+  const { controls } = fixture();
+  const escape = value => String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;');
+  const request = { requestId: 'question-a', policyRevision: 2, action: 'native.question', title: 'Pick <one>',
+    options: [{ optionId: 'q0_first', name: 'First', kind: 'allow_once' },
+      { optionId: 'q0_"second', name: '<Second>', kind: 'allow_once' }, { optionId: 'skip', name: 'Skip', kind: 'reject_once' }] };
+  const html = controls.render(request, escape, { ref: 'chat-a', fullRevision: 3 });
+  assert.match(html, /Pick &lt;one>/); assert.match(html, /&lt;Second>/);
+  assert.match(html, /data-permission-option="q0_&quot;second"/);
+  assert.deepEqual([...html.matchAll(/data-ui-value="([^"]+)"/g)].map(row => row[1]), ['answer', 'answer', 'answer', 'deny']);
+  assert.doesNotMatch(html, /data-ui-value="(?:once|session|full)"|始终允许|允许一次/);
+  for (const options of [[], [request.options[0], request.options[0]], Array(65).fill(request.options[0]), [{ optionId: 'x', name: 'Bad', kind: 'allow_always' }]]) {
+    assert.doesNotMatch(controls.render({ ...request, options }, escape), /data-ui-value="answer"/);
+  }
+});
+
+test('question selection preserves the chosen ID and cancellation sends no choice', async () => {
+  for (const decision of ['answer', 'deny']) {
+    const f = fixture(decision), replies = [];
+    f.button.dataset.permissionOption = 'q0_"second';
+    const api = { answerUi: async (ref, reply) => { replies.push({ ref, ...reply }); return { ok: true }; },
+      setAccessMode() { assert.fail('answering a question cannot change access mode'); } };
+    await f.controls.answer(f.button, api, 'chat-a');
+    assert.deepEqual(replies, [{ ref: 'chat-a', requestId: 'request-a', policyRevision: 2, decision,
+      ...(decision === 'answer' ? { optionId: 'q0_"second' } : {}) }]);
+    assert.equal(f.card.hidden, true);
+  }
+  const f = fixture('answer'); f.button.dataset.permissionOption = 'second';
+  await f.controls.answer(f.button, { answerUi: async () => ({ ok: false, reason: 'stale choice' }) }, 'chat-a');
+  assert.equal(f.card.hidden, false); assert.equal(f.button.disabled, false); assert.equal(f.error.textContent, 'stale choice');
+});
+
+test('localized question attributes remain plain text so chat ownership survives HTML translation wrappers', () => {
+  const f = fixture(), escape = value => String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;');
+  f.window.SoduWorkI18n = { t: source => source === '请选择' ? 'Choose "one"' : source,
+    html: source => '<span data-i18n="' + escape(source) + '">' + escape(source) + '</span>' };
+  const html = f.controls.render({ requestId: 'question-a', policyRevision: 2, action: 'native.question', title: 'Pick one',
+    options: [{ optionId: 'second', name: 'Second', kind: 'allow_once' }] }, escape, { ref: 'chat-a' });
+  const opening = html.slice(0, html.indexOf('>') + 1);
+  assert.match(opening, /aria-label="Choose &quot;one&quot;" data-permission-ref="chat-a">$/);
+  assert.match(html, /role="group" aria-label="Choose &quot;one&quot;">/);
+  assert.match(html, /<b><span data-i18n="请选择">/);
+  assert.doesNotMatch(opening, /<span/);
 });

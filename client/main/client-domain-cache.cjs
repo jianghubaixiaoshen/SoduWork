@@ -5,7 +5,7 @@ const { scopeOf } = require('./native-discovery.cjs');
 const DOMAINS = {
   'conversation-projects': { path: '/conversation-projects', legacyMs: 10000, valid: value => Array.isArray(value?.items) },
   models: { path: '/my-models', legacyMs: 0, valid: value => Array.isArray(value?.usable) && Array.isArray(value?.providers) },
-  config: { path: '/config', legacyMs: 0, valid: value => value && typeof value === 'object' && !Array.isArray(value) },
+  config: { path: '/config?withRevision=true', legacyMs: 0, valid: value => value && typeof value === 'object' && !Array.isArray(value) },
   'team-messages-received': { path: '/team/messages?folder=received&limit=200', topic: 'team-messages', requirePush: true, revalidate: true,
     legacyMs: 0, valid: value => Array.isArray(value?.items) },
   'team-messages-sent': { path: '/team/messages?folder=sent&limit=200', topic: 'team-messages', requirePush: true, revalidate: true,

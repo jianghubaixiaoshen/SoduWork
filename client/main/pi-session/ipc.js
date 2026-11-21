@@ -262,6 +262,11 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       return Reflect.get(target, property);
     },
   });
+  const firstTurnTitle = require('../conversation/first-turn-title').create({
+    app, identityOf: sendIdentityOf || identityOf, authorizeAI,
+    isCurrent: handle => session.get(handle.ref) === handle && !_cloudHandoff.guard(handle) &&
+      !session.isArchived(app, handle.sessionId),
+  });
   _deliverySync = require('../conversation/local-delivery-sync').create({
     notify: handle => _push(BrowserWindow, handle, { kind: 'delivery-sync' }, handle.snapshot()) });
   _cloudHandoff = require('../conversation/cloud-handoff-ipc').install({ app, ipcMain, session,
@@ -480,11 +485,13 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
         return { ok: false, notFound: true, reason: '这条会话已经不存在了' };
       };
       let nativeLocal = false;
+      let knownAccountProjection = false;
       if (local) {
         let executable = true;
         try { historyAccess.assertOwner(app, opts.chatId, historyAccess.actor(app), local); }
         catch (_) { executable = false; }
-        if (local.deleted || local.cached || !executable) return await openLocalHistory();
+        if (local.deleted || local.cached || !executable ||
+            ['claude', 'harness2'].includes(local.adapterId)) return await openLocalHistory();
         // Canonical local identity wins over stale renderer projection flags.
         nativeLocal = true;
         Object.assign(opts, { adapterId: local.adapterId || 'pi',
@@ -534,6 +541,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       const selectedLive = opts.chatId && session.findBySessionId(opts.chatId);
       if (opts.chatId && (!selectedLive || selectedLive.adapterId === 'account-sync') &&
           typeof _accountSync !== 'undefined' && _accountSync?.isAccountConversation?.(opts.chatId)) {
+        knownAccountProjection = true;
         const item = await _accountSync.row(opts.chatId);
         await assertHistoryCurrent();
         if (item?.deleted) return { ok: false, notFound: true, reason: '这条会话已经不存在了' };
@@ -637,9 +645,9 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       // would turn a recoverable history miss into an adapter-not-registered
       // error page. The sidebar can refresh the authenticated directory and
       // retry the projection without creating a duplicate local session.
-      if (opts.chatId && (String(opts.adapterId || '').toLowerCase() === 'account-sync' ||
+      if (opts.chatId && (knownAccountProjection && !nativeLocal || String(opts.adapterId || '').toLowerCase() === 'account-sync' ||
           opts.accountConversation === true || opts.accountProjection === true)) {
-        return { ok: false, notFound: true,
+        return { ok: false, code: 'ACCOUNT_HISTORY_UNAVAILABLE',
           reason: '账号会话暂时无法读取，请刷新历史后重试' };
       }
       if (opts.chatId && typeof _cloudHandoff.reopen === 'function') {
@@ -716,7 +724,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       if (resume?.adapterId && !work.first) opts.adapterId = resume.adapterId;
       if (resume && (String(opts.adapterId || '').toLowerCase() === 'account-sync' ||
           resume.accountConversation === true || resume.accountProjection === true)) {
-        return { ok: false, notFound: true,
+        return { ok: false, code: 'ACCOUNT_HISTORY_UNAVAILABLE',
           reason: '账号会话暂时无法读取，请刷新历史后重试' };
       }
       // History links can omit the Agent or carry a stale composer choice.
@@ -852,6 +860,9 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
          * and draft discovery then use conversation time boundaries.
          */
         resumedConversation: Boolean(resume && !work.bootstrap),
+        // Replaying an archive is not evidence that a later failed attempt succeeded.
+        retainedHistoryId: local?.id,
+        retainedExecutionFailure: (require('../conversation/execution-outcome.cjs').recover(local) || local)?.state === 'failed',
         /* SDK uses the validated directory; the archive path remains separate. */
         resumeCwd: resume ? cwd : '',
         resumeAt: resume ? resume.at : 0,
@@ -914,6 +925,8 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
         appRequest?.assertActive();
         const reply = _openReply(opened.session, { resumed: !!resume, seeded: opened.seeded || 0 });
         accessConsent?.commit();
+        if (!resume && !opts.sessionTitle && !spec.taskRef && !automationContext && !appRequest &&
+            !appPluginId && !opts.nativeRelay && !opened.seeded) firstTurnTitle.enroll(opened.session);
         return reply;
       } catch (error) {
         await closeFailedOpen(opened.session);
@@ -932,7 +945,8 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       try {
         const result = await applicationEntries.navigate(event, raw.chatId);
         if (!result.ok || result.handled) return { ...result, applicationOpened: result.handled === true };
-      } catch (error) { return { ok: false, reason: String(error.message || error) }; }
+      } catch (error) { return { ok: false, reason: String(error.message || error),
+        ...(error.code === 'ACCOUNT_CONVERSATION_DELETED' ? { notFound: true, code: error.code } : {}) }; }
     }
     return openConversation(event, raw);
   });
@@ -1015,6 +1029,8 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       const acceptance = require('../conversation/acceptance-session').assertTask(s, rawOptions?.taskId);
       if (acceptance) rawOptions = { ...(rawOptions || {}), taskId: acceptance.taskRef,
         taskExecution: { acceptanceOnly: true, acceptanceMode: acceptance.acceptanceMode, approvalId: acceptance.approvalId,
+          ...Object.fromEntries(['acceptanceDraft', 'acceptanceInstruction'].filter(key =>
+            typeof rawOptions?.taskExecution?.[key] === 'string').map(key => [key, rawOptions.taskExecution[key]])),
           ...(acceptance.acceptanceAttachmentIds ? { acceptanceAttachmentIds: acceptance.acceptanceAttachmentIds } : {}) } };
       else if (rawOptions?.taskExecution?.acceptanceOnly) {
         if (rawOptions?.taskExecution?.acceptanceExecutionSession !== true)
@@ -1047,6 +1063,10 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
     if (debugBlocked) return { ok: false, reason: debugBlocked };
     let taskTurn = null;
     const taskId = String(rawOptions && rawOptions.taskId || '').trim().slice(0, 120);
+    require('../requirement-diagnostics.cjs').record('native.send', {taskId,conversationId:s.sessionId,
+      turnId:rawOptions?.submissionId,hasTaskBinding:!!taskId,selectedMode:rawOptions?.taskExecution?.submissionMode,
+      runtimeKey:s.adapterId,modelKey:typeof s.model==='string'?s.model:(s.model?.id || s.model?.name),workspaceKey:s.cwd,
+      hubKey:currentIdentity?.hub,accountKey:require('../device-auth-request').accountScopeKey(currentIdentity)});
     const followUpTurn = !!(rawOptions && rawOptions.taskExecution && rawOptions.taskExecution.followUp === true);
     if (taskId) {
       try {
@@ -1063,6 +1083,8 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       } catch (error) {
         // Only an explicitly finished task permits an ordinary follow-up without a receipt.
         // Active receipts, permission failures and network errors must not lose task delivery silently.
+        require('../requirement-diagnostics.cjs').record('native.error',{taskId,conversationId:s.sessionId,
+          turnId:rawOptions?.submissionId,httpStatus:Number(error.status)||0,errorKey:String(error.message || error)});
         if (!followUpTurn || error.code !== 'TASK_FINISHED' || rawOptions.taskExecution?.executionChoice === 'native') return { ok: false, reason: String(error.message || error) };
         console.warn('[task-input] 续轮收据未挂上，按普通会话发送：' + String((error && error.message) || error));
         taskTurn = null;
@@ -1103,6 +1125,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
     const clearPluginSelection = Boolean(rawOptions &&
       (rawOptions.clearPluginSelection === true || rawOptions.pluginSelection === 'clear'));
     const sendOptions = {
+      ...(automationTurn ? { source: 'automation' } : {}),
       ...(taskTurn?.acceptanceOnly ? { beforeTurn: taskTurn.beforeTurn, afterTurn: taskTurn.afterTurn,
         promptText: taskTurn.text } : {}),
       ...(taskLifecycle ? { taskId, taskTitle: taskTurn.task.title || '',
@@ -1155,6 +1178,8 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       try { await rawOptions.nativeRelayGuard(); }
       catch (error) { return { ok: false, accepted: false, reason: String(error.message || error) }; }
     }
+    const titleRequest = !workflowTurn && !taskId && !automationTurn && !appRequest && !rawOptions?.nativeRelayGuard
+      ? firstTurnTitle.prepare(s, text) : null;
     const submitted = workflowTurn || (typeof s.submit === 'function'
       ? await s.submit(text, staged.files, sendOptions)
       : { accepted: true, queued: false, completion: s.send(text, staged.files, sendOptions) });
@@ -1162,6 +1187,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       if (taskTurn?.afterTurn) await taskTurn.afterTurn('stopped').catch(() => {});
       return submitted.result || { ok: false, reason: '这条消息没有被接收' };
     }
+    if (!submitted.queued) void firstTurnTitle.accepted(s, titleRequest);
     if (observe) observe(Promise.resolve(submitted.completion));
     Promise.resolve(submitted.completion).then((r) => {
       if (!r || !r.ok) _publish(BrowserWindow, s, {
@@ -1238,7 +1264,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
     if (!s) return { ok: false, accepted: false, reason: '这条对话已经不在了（可能已关闭）' };
     if (_cloudHandoff.guard(s)) return { ok: false, accepted: false, reason: '请先处理云端交接，再操作本地队列' };
     try {
-      const result = await Promise.resolve(s.cancel());
+      const result = await Promise.resolve(s.cancel({ userInitiated: true }));
       const snapshot = typeof s.uiSnapshot === 'function' ? s.uiSnapshot() : s.snapshot();
       return { ...(result || { ok: true, accepted: true }),
         snapshot: _contextSnapshot(s, snapshot) };
@@ -1250,7 +1276,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
   // after the first click. Keep the legacy one-way channel for older windows
   // and test fixtures that still use ipcRenderer.send().
   ipcMain.handle('pi-session-cancel-request', (_event, ref) => cancelSession(ref));
-  ipcMain.on('pi-session-cancel', (event, ref) => { const s = session.get(ref); if (s) s.cancel(); });
+  ipcMain.on('pi-session-cancel', (event, ref) => { const s = session.get(ref); if (s) s.cancel({ userInitiated: true }); });
   require('./artifact-ipc').install({ app, ipcMain, BrowserWindow, session, workDir,
     resolveSession: handle => _cloudHandoff.artifactSession(handle) });
   require('../conversation/local-delivery-action').install({ app, ipcMain, session, shell,

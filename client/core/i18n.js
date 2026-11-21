@@ -187,24 +187,13 @@
      they are gradually migrated to data-i18n keys.  It deliberately only matches
      complete, known UI phrases so user supplied task and chat content is untouched. */
   const EN_TEXT = global.SoduWorkLocaleMessages?.['en-US'] || {};
-  const diagnosticTemplates = new Set([
-    'Google Harness² {stage}（{phase}）失败：{detail}',
-    'Google Harness² {stage}失败：{detail}',
-    '模型请求失败（HTTP {status}）：{detail}',
-  ]);
-  // Only finite backend-owned diagnostics may translate their nested fields.
-  // Other templates keep user names, provider output and tool text verbatim.
-  const diagnosticParts = Object.fromEntries(['stage', 'phase', 'detail'].map(kind => [kind,
-    new Map(Object.keys(EN_TEXT).filter(key => key.startsWith('harness2.' + kind + '.'))
-      .map(key => [key.slice(('harness2.' + kind + '.').length), key]))]));
   const templates = Object.entries(EN_TEXT).filter(([source]) => /\{\w+\}/.test(source)).sort(([a], [b]) => b.replace(/\{\w+\}/g, '').length - a.replace(/\{\w+\}/g, '').length).map(([source, target]) => {
     const names = [];
     const pattern = source.split(/(\{\w+\})/).map(part => {
       if (/^\{\w+\}$/.test(part)) { names.push(part.slice(1, -1)); return '([\\s\\S]*?)'; }
       return part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }).join('');
-    return { expression: new RegExp('^' + pattern + '$'), names, target, source,
-      diagnostic: diagnosticTemplates.has(source) };
+    return { expression: new RegExp('^' + pattern + '$'), names, target, source };
   });
   let currentLocale = initialLocale();
   let windowTitle = global.__soduworkWindowTitle || null;
@@ -241,7 +230,7 @@
     windowTitle = { label, detail };
     if (global.document) global.document.title = 'SoduWork' + (label ? ' · ' + translateText(label) : '') + (detail ? ' · ' + detail : '');
   }
-  function translateText(value, target = read(), diagnosticDepth = 0) {
+  function translateText(value, target = read()) {
     const text = String(value == null ? '' : value);
     if (target === SOURCE_LOCALE) return text;
     const trimmed = text.trim().replace(/\s+/g, ' ');
@@ -262,21 +251,6 @@
         const match = template.expression.exec(text.trim());
         if (!match) continue;
         const params = Object.fromEntries(template.names.map((name, i) => [name, match[i + 1]]));
-        if (template.diagnostic) {
-          if (diagnosticDepth > 1 || Object.values(params).some(value => value.length > 512)) return text;
-          for (const [name, value] of Object.entries(params)) {
-            if (name === 'status' && /^[1-5]\d{2}$/.test(value)) continue;
-            const key = diagnosticParts[name]?.get(value);
-            if (key) params[name] = selectedCatalog[key] ?? fallbackCatalog[key] ?? value;
-            else if (name === 'detail' && value.startsWith('模型请求失败（HTTP ')) {
-              params[name] = translateText(value, target, diagnosticDepth + 1);
-              if (params[name] === value) return text;
-            } else return text;
-          }
-          const localized = selectedCatalog[template.source] ?? template.target;
-          entry = localized.replace(/\{(\w+)\}/g, (all, name) => params[name] ?? all);
-          break;
-        }
         // Guard: a slot that swallowed a whole clause (sentence-final punctuation
         // inside, or an implausibly long capture) means the template only aligned
         // by accident; reordering that would scramble the sentence. Skip and let
@@ -372,8 +346,24 @@
   if (global.document?.readyState === 'loading') global.addEventListener('DOMContentLoaded', ready, { once: true });
   else ready();
   global.addEventListener('storage', event => {
-    if (event.key === 'soduwork_work_cfg_v5_locale' && event.newValue) setLocale(event.newValue, { persist: false, broadcast: false });
+    if (event.key !== 'soduwork_work_cfg_v5_locale' || !event.newValue) return;
+    // Queued events can contain an older choice. Read the current mirror so
+    // receiving a notification cannot write stale values back to other windows.
+    let latest = event.newValue;
+    try { latest = global.localStorage.getItem('soduwork_work_cfg_v5_locale'); } catch (_) {}
+    if (latest) setLocale(latest, { persist: false, broadcast: false });
   });
-  global.soduWorkAPI?.onLocaleChange?.(value => setLocale(value, { persist: false, broadcast: false }));
+  global.soduWorkAPI?.onLocaleChange?.(value => {
+    // Renderers save explicit choices before sending IPC. A delayed native echo
+    // must not replace that choice; other windows publish theirs to the same mirror.
+    let latest = value;
+    try {
+      if (global.localStorage.getItem('soduwork_work_cfg_v5_locale_explicit') === '1') {
+        const chosen = global.localStorage.getItem('soduwork_work_cfg_v5_locale');
+        if (LOCALES[chosen]) latest = chosen;
+      }
+    } catch (_) {}
+    setLocale(latest, { persist: false, broadcast: false });
+  });
   setLocale(currentLocale, { persist: false, initial: true });
 })(window);

@@ -6,6 +6,13 @@
 // translation pass. The native file-picker captions of the client release upload
 // dialog live here too because they are the same class of host-locale leakage.
 export default {
+  "按名称或标识筛选插件使用列表": "Filter plugin usage by name or ID",
+  "延迟分桶上限（毫秒）：": "Latency bucket ceilings (ms): ",
+  "无服务端错误的请求": "Requests without a server error",
+  "未匹配到路由的请求（{0}%）": "Requests matching no route ({0}%)",
+  "已取消上传": "Upload canceled",
+  "上传进度": "Upload progress",
+  "上传完成，正在等待服务端校验。": "Upload complete. Waiting for server verification.",
   '数据库连接正常': 'Database connection healthy',
   '数据库不可用': 'Database unavailable',
   '数据库不可用：{0}': 'Database unavailable: {0}',
@@ -22,6 +29,13 @@ export default {
   '未选择任何文件': 'No file chosen',
 }
 export const ja = {
+  "按名称或标识筛选插件使用列表": "名前または ID でプラグイン利用状況を絞り込み",
+  "延迟分桶上限（毫秒）：": "遅延バケットの上限（ミリ秒）：",
+  "无服务端错误的请求": "サーバーエラーのないリクエスト",
+  "未匹配到路由的请求（{0}%）": "ルート未一致のリクエスト（{0}%）",
+  "已取消上传": "アップロードをキャンセルしました",
+  "上传进度": "アップロードの進捗",
+  "上传完成，正在等待服务端校验。": "アップロード完了。サーバーの検証を待っています。",
   '数据库连接正常': 'データベース接続は正常です',
   '数据库不可用': 'データベースに接続できません',
   '数据库不可用：{0}': 'データベースに接続できません: {0}',
@@ -38,6 +52,13 @@ export const ja = {
   '未选择任何文件': 'ファイルが選択されていません',
 }
 export const ko = {
+  "按名称或标识筛选插件使用列表": "이름 또는 ID로 플러그인 사용 목록 필터링",
+  "延迟分桶上限（毫秒）：": "지연 시간 구간 상한(ms): ",
+  "无服务端错误的请求": "서버 오류가 없는 요청",
+  "未匹配到路由的请求（{0}%）": "경로가 일치하지 않은 요청 ({0}%)",
+  "已取消上传": "업로드가 취소되었습니다",
+  "上传进度": "업로드 진행률",
+  "上传完成，正在等待服务端校验。": "업로드 완료. 서버 검증을 기다리는 중입니다.",
   '数据库连接正常': '데이터베이스 연결이 정상입니다',
   '数据库不可用': '데이터베이스를 사용할 수 없음',
   '数据库不可用：{0}': '데이터베이스를 사용할 수 없음: {0}',

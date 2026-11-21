@@ -1,5 +1,6 @@
 (function (global) {
   const messages = {
+    '已选底座': 'Selected runtime',
     '这条旧会话缺少服务归属信息，原文件已保留，暂时无法读取': 'This legacy conversation lacks service ownership information. The original file is preserved but cannot be read yet.',
     '无法确认这条会话属于当前账号，请明确导入后再查看': 'This conversation cannot be verified as belonging to this account. Import an eligible legacy conversation explicitly to view a copy.',
     '无法确认这条会话属于当前账号或服务，请切回原连接': 'This conversation cannot be verified as belonging to the current account and service. Switch back to its original connection.',
@@ -37,6 +38,8 @@
     '选择后自动保存，重启后继续使用所选目录。': 'Your selection is saved automatically and used again after restarting.',
     '工作目录已保存': 'Work directory saved',
     '无法保存工作目录，请重试': 'Could not save the work directory. Try again.',
+    '所选工作位置不是文件夹': 'The selected location is not a folder.',
+    '工作目录不可用，请选择可读写的文件夹': 'This folder is unavailable. Choose a folder you can read and write to.',
     '展开最近需求': 'Expand recent issues',
     '收起最近需求': 'Collapse recent issues',
     '无法切换服务': 'Could not switch services',

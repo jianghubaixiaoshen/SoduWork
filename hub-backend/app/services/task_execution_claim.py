@@ -47,6 +47,8 @@ async def prepare(session, client, tid):
     if not own and (task.work_routing or {}).get("conversationTurn"):
         raise HTTPException(409, "需求已有执行会话，请先由原执行人处理后再转交")
     if not own:
+        from . import requirement_timeline
+        previous_definition = requirement_timeline.definition(task)
         previous, previous_account = task.owner_client_id, task.owner_user_id or ""
         # SQLite ignores FOR UPDATE. Compare scalar facts before taking its
         # write lock; JSON equality is not portable to PostgreSQL's JSON type.
@@ -78,6 +80,8 @@ async def prepare(session, client, tid):
             raise HTTPException(409, "需求已进入执行或验收，请刷新后确认")
         task_events.record(session, tid, "claim", {"from": previous, "to": device.id,
                            "source": "requirement-assignee"}, user.display_name or user.username)
+        await requirement_timeline.record_definition(session, task, previous_definition,
+            int(expected["requirement_version"] or 1))
         await session.commit()
         await session.refresh(task)
         await task_access.publish_task(session, task, "task.updated")

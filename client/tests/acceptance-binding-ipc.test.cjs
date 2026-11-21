@@ -16,7 +16,7 @@ function fixture(t) {
     workRouting: { conversationTurn: { conversationId: 'conversation' } } };
   const context = { task, canDecide: true, approvalId: 'approval', artifactVersionId: 'v1',
     requirementVersion: 1, criteria: [{ id: 'c1', label: 'Meets the requirement' }], attachmentIds: [] };
-  const app = { getPath: () => root }, calls = [], handlers = new Map();
+  const app = { getPath: () => root }, calls = [], prompts = [], handlers = new Map();
   const handle = { sessionId: 'conversation', ref: 'native', cwd: root, taskIds: [],
     async bindTask(id) { this.taskIds = [id]; calls.push('bound'); return { ok: true }; },
     async submit(text, files, options) {
@@ -26,10 +26,13 @@ function fixture(t) {
       assert.doesNotMatch(text, /artifactVersionId|criterion|本次固定交付版本/);
       assert.match(options.promptText, /本次固定交付版本：v1/);
       assert.match(options.promptText, /验收分析/);
+      prompts.push(options.promptText);
       calls.push('sent');
       return { accepted: true, completion: Promise.resolve({ ok: true }) };
     } };
   const modules = {
+    '../requirement-diagnostics.cjs': require('../main/requirement-diagnostics.cjs'),
+    '../device-auth-request': require('../main/device-auth-request'),
     './skill-turn': require('../main/pi-session/skill-turn'),
     '../conversation/requirement-context': require('../main/conversation/requirement-context'),
     '../conversation/acceptance-session': require('../main/conversation/acceptance-session'),
@@ -42,6 +45,7 @@ function fixture(t) {
     sendIdentityOf: async () => identity, identityOf: async () => identity,
     memories: { assertOwner() {} }, updateWorkloads: { guard: () => ({ ok: true }) },
     _cloudHandoff: { guard: () => false }, workDir: () => root, startReceipts: {},
+    firstTurnTitle: { prepare: () => null, accepted() {} },
     taskInput: { request: async () => task, prepare: async (owner, id, chat, submission, text, requested, runtime) => {
       calls.push('prepared');
       return require('../main/pi-session/acceptance-turn').prepare({ identity: owner, taskId: id,
@@ -65,15 +69,21 @@ function fixture(t) {
     _render() {}, _mount: () => ({ querySelector: () => input }),
     _api: () => ({ bindTask: (...args) => handlers.get('pi-session-bind-task')({}, ...args) }) };
   const controller = window.ChatTaskController.create(ctx);
-  const send = (taskId = task.id) => handlers.get('pi-session-send')({}, handle.ref, input.value, [], {
-    taskId, taskExecution: { acceptanceOnly: true, acceptanceExecutionSession: true, approvalId: 'approval' },
+  const send = (taskId = task.id, extra = {}) => handlers.get('pi-session-send')({}, handle.ref, input.value, [], {
+    taskId, taskExecution: { acceptanceOnly: true, acceptanceExecutionSession: true, approvalId: 'approval', ...extra },
   });
-  return { task, context, calls, handle, ctx, send, open: () => controller._openTask(task.id, task.title,
+  return { task, context, calls, prompts, input, handle, ctx, send,
+    createAcceptance: () => modules['../conversation/acceptance-session'].attach(app, handle,
+      { acceptanceSession: true, taskRef: task.id, acceptanceMode: 'manual', approvalId: 'approval' }, identity),
+    open: () => controller._openTask(task.id, task.title,
     { task, source: 'acceptance', acceptanceExecutionSession: true, approvalId: 'approval' }) };
 }
 
 test('reopening analysis repairs a renderer-only task association through native bind and send handlers', async t => {
   const f = fixture(t);
+  const diagnosticRows=[];
+  t.mock.method(require('../main/requirement-diagnostics.cjs'),'record',(event,data)=>diagnosticRows.push({event,...data}));
+  f.handle.model={id:'synthetic-model',name:'Synthetic model'};
   const before = await f.send();
   assert.equal(before.ok, false);
   assert.match(before.reason, /原执行会话尚未绑定这项需求/);
@@ -84,6 +94,20 @@ test('reopening analysis repairs a renderer-only task association through native
   assert.equal(after.accepted, true);
   assert.deepEqual(f.calls, ['bound', 'prepared', 'sent']);
   assert.equal(f.ctx._sessionOptions.acceptanceSession, false);
+  assert.equal(diagnosticRows.find(row=>row.event==='native.send').modelKey,'synthetic-model');
+});
+
+test('dedicated acceptance IPC retains draft provenance while enforcing the saved approval mode', async t => {
+  const f = fixture(t);
+  await f.createAcceptance();
+  f.input.value = '【验收分析】\nAn obsolete copied description.';
+  const result = await f.send(f.task.id, { acceptanceMode: 'auto', approvalId: 'forged-approval',
+    acceptanceDraft: f.input.value, acceptanceInstruction: 'Check the revised wording.' });
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(f.prompts.length, 1);
+  assert.match(f.prompts[0], /本轮验收人新增说明.*\nCheck the revised wording/);
+  assert.doesNotMatch(f.prompts[0], /obsolete copied description|本轮已授权自动验收/);
+  assert.equal(f.handle.acceptanceSession.approvalId, 'approval');
 });
 
 test('binding repair preserves task, execution-device, reviewer and pinned-approval send guards', async t => {

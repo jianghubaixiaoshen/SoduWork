@@ -49,7 +49,7 @@ async def plugins(
     user: User = Depends(require_any_perm("plugin.manage", "plugin.run")),
     session: AsyncSession = Depends(get_session),
 ):
-    return {"items": await plugin_service.list_plugins(session, await _scope(session, user))}
+    return {"items": await plugin_service.management_catalog(session, await _scope(session, user))}
 
 @router.get("/governance")
 async def plugin_governance_overview(

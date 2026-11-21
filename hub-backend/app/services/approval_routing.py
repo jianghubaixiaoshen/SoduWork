@@ -231,52 +231,67 @@ async def preview_assignments(session: AsyncSession, task: models.Task, action: 
             "excluded": sorted(excluded)}
 
 
+async def _clear_restored_review_issue(session: AsyncSession, task: models.Task,
+                                     request: am.ApprovalRequest,
+                                     artifact: am.ArtifactVersion | None) -> None:
+    current = (task.work_routing or {}).get("conversationTurn") or {}
+    if (current.get("deliveryIssue") or {}).get("code") != "review_unassigned":
+        return
+    # Assignment reconciliation also runs on read paths. Refresh under the task
+    # lock before replacing routing so a stale reader cannot undo a newer turn.
+    # Normal autoflush retains this transaction's admitted routing changes.
+    task = await session.scalar(select(models.Task).where(models.Task.id == task.id)
+        .with_for_update().execution_options(populate_existing=True))
+    if task is None:
+        return
+    routing = dict(task.work_routing or {})
+    current = dict(routing.get("conversationTurn") or {})
+    issue = current.get("deliveryIssue") or {}
+    if (issue.get("code") != "review_unassigned"
+            or issue.get("artifactVersionId") != request.artifact_version_id
+            or not current.get("conversationId") or artifact is None
+            or request.task_id != task.id or artifact.task_id != task.id
+            or artifact.source_ref != "conversation:" + current["conversationId"]):
+        return
+    current.pop("deliveryIssue", None)
+    routing["conversationTurn"] = current
+    task.work_routing = routing
+
+
+class ApprovalRerouteConflict(ValueError):
+    """Replacing the assignments would leave an approval without its quorum."""
+
+
 async def ensure_assignments(session: AsyncSession, task: models.Task,
-                             request: am.ApprovalRequest) -> list[am.ApprovalAssignment]:
+                             request: am.ApprovalRequest, *,
+                             replace: bool = False) -> list[am.ApprovalAssignment]:
     existing = list((await session.execute(select(am.ApprovalAssignment).where(
         am.ApprovalAssignment.request_id == request.id
     ).order_by(am.ApprovalAssignment.created_at))).scalars().all())
-    if request.action == "review" and request.status == "pending":
-        # Review has exactly one eligible person (the creator). Reconcile old
-        # pending requests that were materialized with executor/permission
-        # assignments before this rule existed, so inbox and detail reads do
-        # not keep exposing the old approver.
-        rules = dict(request.policy_snapshot or {})
-        candidates, excluded = await _candidate_map(
-            session, task, request.action, rules,
-            await session.get(am.ArtifactVersion, request.artifact_version_id))
-        desired = set(candidates)
-        if {str(row.user_id) for row in existing} != desired:
-            if existing:
-                await session.execute(delete(am.ApprovalAssignment).where(
-                    am.ApprovalAssignment.request_id == request.id))
-            existing = []
-        if existing:
-            return existing
-        rows = []
-        for uid, item in candidates.items():
-            user = item["user"]
-            rows.append(am.ApprovalAssignment(
-                request_id=request.id, user_id=uid,
-                user_name=user.display_name or user.username,
-                sources=item["sources"],
-            ))
-        for row in rows:
-            session.add(row)
-        await session.flush()
-        if not rows:
-            await _record_unassigned(session, task, request, excluded)
-        return rows
-    if existing:
-        if not dict(request.policy_snapshot or {}).get("separationOfDuties"):
+    pending_review = request.action == "review" and request.status == "pending"
+    rules = dict(request.policy_snapshot or {})
+    if existing and not replace and not pending_review:
+        if not rules.get("separationOfDuties"):
             return existing
         artifact = await session.get(am.ArtifactVersion, request.artifact_version_id)
         excluded = await _implementer_ids(session, task, artifact)
         return [row for row in existing if str(row.user_id) not in excluded]
-    rules = dict(request.policy_snapshot or {})
+
     artifact = await session.get(am.ArtifactVersion, request.artifact_version_id)
     candidates, excluded = await _candidate_map(
         session, task, request.action, rules, artifact)
+    if replace and len(candidates) < request.required_count:
+        raise ApprovalRerouteConflict(
+            f"无法更换项目负责人：任务「{task.title}」的审批需要 {request.required_count} 人，"
+            f"但当前只能分配给 {len(candidates)} 人；请先处理该审批单")
+    if existing:
+        # Pending reviews also reconcile legacy assignments with the creator-only rule.
+        if not replace and {str(row.user_id) for row in existing} == set(candidates):
+            await _clear_restored_review_issue(session, task, request, artifact)
+            return existing
+        await session.execute(delete(am.ApprovalAssignment).where(
+            am.ApprovalAssignment.request_id == request.id))
+
     rows = []
     for uid, item in candidates.items():
         user = item["user"]
@@ -290,6 +305,8 @@ async def ensure_assignments(session: AsyncSession, task: models.Task,
     await session.flush()
     if not rows:
         await _record_unassigned(session, task, request, excluded)
+    elif pending_review:
+        await _clear_restored_review_issue(session, task, request, artifact)
     return rows
 
 
@@ -448,18 +465,19 @@ async def reroute_pending_for_project(session: AsyncSession, project_id: str,
     """Explicitly reissue undecided approvals after project responsibilities change. Preserve any
     countersignature snapshot with an existing decision and audit all reassignment.
     """
-    task_ids = set((await session.execute(select(models.Task.id).where(
-        models.Task.project_id == project_id
-    ))).scalars().all())
-    if not task_ids:
+    # Decisions take the task lock first. Wait for in-flight votes before
+    # deciding which assignment snapshots can still be replaced.
+    pending_tasks = select(am.ApprovalRequest.task_id).where(am.ApprovalRequest.status == "pending")
+    task_rows = (await session.scalars(select(models.Task).where(
+        models.Task.project_id == project_id, models.Task.id.in_(pending_tasks)
+    ).order_by(models.Task.id).with_for_update())).all()
+    tasks = {row.id: row for row in task_rows}
+    if not tasks:
         return {"requests": 0, "assignments": 0, "skipped": 0}
     requests = list((await session.execute(select(am.ApprovalRequest).where(
-        am.ApprovalRequest.task_id.in_(task_ids),
+        am.ApprovalRequest.task_id.in_(tasks),
         am.ApprovalRequest.status == "pending",
     ))).scalars().all())
-    tasks = {row.id: row for row in (await session.execute(select(models.Task).where(
-        models.Task.id.in_(task_ids)
-    ))).scalars().all()}
     changed = assignments = skipped = 0
     for request in requests:
         decided = await session.scalar(select(am.ApprovalDecision.id).where(
@@ -468,10 +486,7 @@ async def reroute_pending_for_project(session: AsyncSession, project_id: str,
         if decided:
             skipped += 1
             continue
-        await session.execute(delete(am.ApprovalAssignment).where(
-            am.ApprovalAssignment.request_id == request.id
-        ))
-        rows = await ensure_assignments(session, tasks[request.task_id], request)
+        rows = await ensure_assignments(session, tasks[request.task_id], request, replace=True)
         assignments += len(rows)
         changed += 1
         session.add(models.TaskEvent(

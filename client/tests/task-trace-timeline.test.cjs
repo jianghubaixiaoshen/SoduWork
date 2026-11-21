@@ -50,6 +50,11 @@ test('activity translates internal events, statuses and service actors without r
   assert.match(html, /&lt;script&gt;keep original note/);
 });
 
+test('saved requirement definitions have a readable activity label without exposing the event kind', () => {
+  const html=view().timelineHtml([{kind:'requirement.definition',at:'2026-11-15T01:00:00Z',detail:{}}]);
+  assert.match(html,/需求内容已保存/);assert.doesNotMatch(html,/requirement\.definition/);
+});
+
 test('automatic acceptance labels require a matching recorded request, version, actor and verdict', () => {
   const approval = {kind: 'release.approved', actor: 'Alice', detail: {action: 'review', requestId: 'r', versionId: 'v', note: 'AI 验收：human supplied text'}};
   const report = {kind: 'artifact.auto_reviewed', actor: 'Alice', detail: {requestId: 'r', versionId: 'v', verdict: 'approved'}};

@@ -341,6 +341,26 @@ function _syncAssistantContent(state, msg, content) {
 }
 
 
+function beginTurn(state, running = true) {
+  state.ranTurn = running;
+  state.turnMessageFrom = state.messages.length;
+  state.settled = !running;
+  state.aborted = false;
+  state.protocolIssue = null;
+  state.continuationPending = false;
+  state.lastStopReason = '';
+  state.rawStopReason = '';
+  state.lastAssistantError = '';
+  state.lastErrorAfterToolResult = false;
+  state.incompleteReason = '';
+  /*
+   * Invalidate unanswered prior-turn UI requests when a new turn begins to avoid permanent
+   * waiting-user state.
+   */
+  state.pendingUi = null;
+  if (state.modelRetry) state.modelRetry.active = false;
+}
+
 /* Apply one event in place and return affected state for incremental publication. */
 function apply(state, ev) {
   if (!ev || typeof ev !== 'object') return { kind: 'ignored' };
@@ -422,6 +442,13 @@ function apply(state, ev) {
             state.goalActive = false;
             state.currentScope = SCOPES.NORMAL;
           }
+          // Adapters can omit agent_start. A user message in a history replay, however,
+          // does not prove the runtime actually started that turn.
+          const alreadyStarted = !state.settled && state.turnMessageFrom === state.messages.length;
+          if (!alreadyStarted) beginTurn(state, !ev.replay);
+          state.retried = false;
+          state.retryError = '';
+          state.lastError = '';
           state.messages.push({ role: 'user', text: visible.text, attachments: visible.attachments,
             sentAt: require('../conversation/message-time').epoch(m.sentAt),
             ...(m.submissionId ? { submissionId: String(m.submissionId).slice(0, 128) } : {}),
@@ -453,6 +480,8 @@ function apply(state, ev) {
       msg.stopReason = String(m.stopReason || '');
       msg.rawStopReason = String(m.rawStopReason || '');
       msg.errorMessage = String(m.errorMessage || '');
+      msg.afterToolResult = ev.afterToolResult === true;
+      state.lastErrorAfterToolResult = msg.afterToolResult;
       state.lastStopReason = msg.stopReason;
       state.rawStopReason = msg.rawStopReason;
       state.lastAssistantError = msg.errorMessage;
@@ -554,22 +583,7 @@ function apply(state, ev) {
      * remain available.
      */
     case 'agent_start':
-      state.ranTurn = true;
-      state.turnMessageFrom = state.messages.length;
-      state.settled = false;
-      state.aborted = false;
-      state.protocolIssue = null;
-      state.continuationPending = false;
-      state.lastStopReason = '';
-      state.rawStopReason = '';
-      state.lastAssistantError = '';
-      state.incompleteReason = '';
-      /*
-       * Invalidate unanswered prior-turn UI requests when a new turn begins to avoid permanent
-       * waiting-user state.
-       */
-      state.pendingUi = null;
-      if (state.modelRetry) state.modelRetry.active = false;
+      beginTurn(state);
       return { kind: 'run' };
 
     case 'agent_settled':
@@ -639,7 +653,7 @@ function statusText(state) {
   }
   if (s === 'unreachable') {
     const raw = (state.lastAssistantError || state.retryError || state.lastError || '').trim();
-    const detail = modelErrors.forDisplay(raw, 200);
+    const detail = modelErrors.forDisplay(raw, 200, state.lastAssistantError && state.lastErrorAfterToolResult);
     if (state.lastStopReason === 'error') {
       return '模型服务在回答过程中中断了这一轮' +
         (detail ? '（' + detail + '）' : '') + '。' +

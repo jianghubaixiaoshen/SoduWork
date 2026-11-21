@@ -19,7 +19,8 @@
       item.projectId, item.project?.id, item.repoId, item.repo, item.agentId, item.agentKind,
       item.assigneeType, item.squadId, item.workflowBindingId, item.model, item.reasoningEffort,
       item.executionContext, routing.executionContext, routing.selectedStrategy, routing.selectedAgentId,
-      routing.workflowBindingId, routing.selectedWorkflowBindingId, routing.requiredAgentCapabilities]);
+      routing.workflowBindingId, routing.selectedWorkflowBindingId, routing.requiredAgentCapabilities,
+      routing.conversationTurn]);
   }
 
   function create(ctx, {
@@ -219,17 +220,20 @@
       if (!task) return { ok: false, reason: '需求不存在' };
       if (!isPickableTask(task)) return { ok: false, reason: '需求尚未准备好、已开始执行或无执行权限，请在需求池查看当前状态' };
       const requestedScope = dispatchScope(task);
-      let preferredCreation = false;
+      let preferredOriginal = false;
       if (opts.source === 'task-dispatch' && !opts.forceNew && !opts.chatId && !opts.reuseConversation &&
           !opts.acceptanceSession && !opts.acceptanceExecutionSession && !opts.reworkSession) {
         const original = await global.TaskConversationNavigation?.preferredConversation?.(task);
         if (!current()) return {ok:false,reason:'会话已切换，需求未发送，请在目标会话重试'};
         if (original) {
-          preferredCreation = !task.workRouting?.conversationTurn?.conversationId;
+          preferredOriginal = true;
           opts = {...opts, chatId: original, preferredConversation: true};
         }
       }
       const selection = _taskExecutionConfig(task, opts), config = selection.config;
+      // Arranging execution is an explicit dispatch, even when its archive
+      // already has requirement context from a previous turn.
+      if (opts.source === 'task-dispatch' && !opts.reuseConversation) config.reuseConversation = false;
       if (['task-dispatch', 'requirement-session'].includes(opts.source) && Object.hasOwn(opts, 'brief')) {
         config.dispatchInstructions = {note: String(opts.brief || ''),
           submissionMode: opts.submissionMode || 'default'};
@@ -262,23 +266,68 @@
       let opened = await _openTask(taskId, task.title, openOptions);
       if (!opened) return { ok: false, reason: ctx._taskOpenError || '需求会话未能打开' };
       const restored = ctx.sessionInfo();
-      const differentChoice = Boolean(kind && kind !== restored.adapterId || config.model && config.model !== ctx._workModel());
-      if (preferredCreation && !controlled && differentChoice) {
-        // Creation provenance is a navigation preference, not an execution choice.
-        // Keep that archive intact when the executor explicitly chooses another runtime or model.
+      const codexChoice = (kind || restored.adapterId) === 'codex';
+      const differentChoice = Boolean(kind && kind !== restored.adapterId || config.model && config.model !== ctx._workModel() ||
+        codexChoice && config.reasoningEffort && config.reasoningEffort !== ctx._snap?.thinking?.level);
+      if (preferredOriginal && !controlled && differentChoice) {
+        // An explicit dispatch choice changes the active runtime segment, not
+        // the original conversation identity or its creation/execution history.
         const sameView = _viewGuard(), sequence = ctx._taskOpenSeq;
-        let latest;
-        try { latest = await global.SoduWorkAPI.getTask(taskId); }
-        catch (_) { return {ok:false, reason:'需求暂时无法确认，请重新安排执行'}; }
-        if (!sameView() || sequence !== ctx._taskOpenSeq)
-          return {ok:false, reason:'会话已切换，需求未发送，请在目标会话重试'};
-        if (String(latest?.id || '') !== String(taskId) || !isPickableTask(latest) ||
-            latest.workRouting?.conversationTurn?.conversationId || dispatchScope(latest) !== requestedScope)
-          return {ok:false, reason:'需求状态或执行配置已变化，请重新安排执行'};
-        task = latest;
-        opened = await _openTask(taskId, task.title, {...openOptions, task,
-          forceNew:true, chatId:'', preferredConversation:false, reuseCurrent:false, navigation:true});
-        if (!opened) return {ok:false, reason:ctx._taskOpenError || '需求会话未能打开'};
+        const unchanged = () => sameView() && sequence === ctx._taskOpenSeq;
+        const confirmTask = async () => {
+          let latest;
+          try { latest = await global.SoduWorkAPI.getTask(taskId); }
+          catch (_) { throw Error('需求暂时无法确认，请重新安排执行'); }
+          if (!unchanged()) throw Error('会话已切换，需求未发送，请在目标会话重试');
+          if (String(latest?.id || '') !== String(taskId) || !isPickableTask(latest) || dispatchScope(latest) !== requestedScope)
+            throw Error('需求状态或执行配置已变化，请重新安排执行');
+          task = latest;
+        };
+        try {
+          await confirmTask();
+          const api = ctx._api(), ref = ctx._ref;
+          if (kind && kind !== ctx.sessionInfo().adapterId) {
+            if (typeof api.selectAgent !== 'function') throw Error('当前客户端不支持切换底座，请更新后在原会话重试');
+            const result = await api.selectAgent(ref, kind, {modelName: config.model});
+            if (!unchanged()) throw Error('会话已切换，需求未发送，请在目标会话重试');
+            if (!result?.ok) throw Error(result?.reason || '底座切换未能确认，请在原会话重试');
+            if (!result.snapshot || result.snapshot.adapterId !== kind)
+              throw Error('底座切换结果尚未确认，请重新打开原会话后重试');
+            ctx._snap = result.snapshot;
+            ctx._sessionOptions.adapterId = result.snapshot.adapterId;
+            ctx._sessionOptions.displayName = result.snapshot.displayName || result.displayName;
+            ctx._sessionOptions.modelName = result.snapshot.modelSelection?.name || '';
+            ctx._sessionOptions.modelLabel = result.snapshot.modelSelection?.model?.label || ctx._sessionOptions.modelName;
+            ctx._sessionOptions.reasoningEffort = kind === 'codex' ? result.snapshot.thinking?.level || '' : '';
+            ctx._model = result.snapshot.modelSelection?.model || null;
+            ctx._render();
+          } else if (config.model && config.model !== ctx._workModel()) {
+            if (typeof api.selectModel !== 'function') throw Error('当前底座不支持切换模型，请在原会话核对执行选项');
+            const result = await api.selectModel(ref, config.model);
+            if (!unchanged()) throw Error('会话已切换，需求未发送，请在目标会话重试');
+            if (!result?.ok || !result.selection) throw Error(result?.reason || '模型切换未能确认，请在原会话重试');
+            if (ctx._snap) ctx._snap.modelSelection = result.selection;
+            ctx._sessionOptions.modelName = result.selection.name;
+            ctx._sessionOptions.modelLabel = result.selection.model?.label || result.selection.name;
+            ctx._model = result.selection.model || null;
+            if (result.thinking && ctx._snap) ctx._snap.thinking = result.thinking;
+            ctx._render();
+          }
+          if (config.model && config.model !== ctx._workModel())
+            throw Error('模型切换结果尚未确认，请在原会话重新选择后重试');
+          if (codexChoice && config.reasoningEffort) {
+            if (typeof api.setThinking !== 'function') throw Error('当前客户端不支持切换推理强度，请更新后重试');
+            const result = await api.setThinking(ref, config.reasoningEffort);
+            if (!unchanged()) throw Error('会话已切换，需求未发送，请在目标会话重试');
+            if (!result?.ok || result.thinking?.level !== config.reasoningEffort)
+              throw Error(result?.reason || '推理强度尚未确认，请在原会话重试');
+            if (ctx._snap) ctx._snap.thinking = result.thinking;
+            ctx._sessionOptions.reasoningEffort = result.thinking.level;
+          }
+          await confirmTask();
+        } catch (error) {
+          return {ok:false, reason:String(error?.message || '执行选项未能确认，请在原会话重试')};
+        }
       }
       if (opts.reuseConversation) {
         const reason = global.RequirementSessionContext?.compatibility(task, _sessionContext());

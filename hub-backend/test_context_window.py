@@ -26,6 +26,13 @@ class ContextWindowTests(unittest.TestCase):
         self.assertEqual(resolved["contextWindowSource"], "safe-default")
         self.assertEqual(normalize("not-a-number"), 0)
 
+    def test_deepseek_v4_models_use_their_own_context_window(self):
+        self.assertEqual(resolve({"model": "deepseek-flash"})["contextWindow"], 1_048_576)
+        self.assertEqual(resolve({"modelName": "deepseek/deepseek-v4-pro",
+                                  "provider": "deepseek"})["contextWindow"], 1_048_576)
+        self.assertEqual(resolve({"model": "deepseek-flash",
+                                  "contextWindow": 80_000})["contextWindow"], 80_000)
+
 
 if __name__ == "__main__":
     unittest.main()

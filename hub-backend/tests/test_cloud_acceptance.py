@@ -188,6 +188,27 @@ class MobileAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             await conversation_message_receipts.send(self.session, self.fixture.client,
                 self.task.id, self.execution.ref, 'replace the result', 'later', {})
 
+    async def test_inputs_pin_business_timeline_and_later_feedback_blocks_decision(self):
+        note = 'Preserve the complete latest clarification ' + '文' * 1800
+        self.session.add(models.TaskEvent(task_id=self.fixture.task.id, kind='execution.instructions', detail={'note': note}))
+        await self.session.commit()
+        _, prompt = await svc.inputs(self.session, self.handoff, instruction='Check the result')
+        self.assertIn(note, prompt)
+        self.assertIn('原始需求、补充说明、退回意见发生冲突时', prompt)
+        self.assertIn('时间相同时不能猜测先后', prompt)
+        self.assertIn('引用或重发不改变原时间', prompt)
+        revision = self.handoff.options['acceptance']['requirementTimelineRevision']
+        self.assertEqual(len(revision), 64)
+        self.assertEqual(svc.clean(self.handoff.options['acceptance'])['requirementTimelineRevision'], revision)
+        self.session.add(models.TaskEvent(task_id=self.fixture.task.id, kind='release.rejected',
+            detail={'action': 'review', 'note': 'A newer returned correction must be considered'}))
+        await self.session.commit()
+        with self.assertRaises(HTTPException) as caught:
+            await self.settle()
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIsNone(self.fixture.task.reviewed_at)
+        self.assertEqual(len((await self.session.scalars(select(am.ApprovalDecision))).all()), 0)
+
     async def test_start_contract_rejects_malformed_reference_and_foreign_actor(self):
         for value in [{}, {**self.binding, 'report': {}}, {**self.binding, 'taskId': '../other'},
                       {**self.binding, 'requirementVersion': True}]:

@@ -186,10 +186,15 @@ async function fixture(t, spec, legacySendIdentity = false) {
   bridge = createPiSessionBridge({ app, sessionModule: engine,
     runnerAdapters: catalog.runtimes().filter(row => row.transport === 'runner').map(row => createRunnerRuntimeAdapter({
       app, runtimeSpec: row, runnerRuntime: runtime,
-      modelConfig: { fetchModel: async () => ({ ok: true, model }) },
+      modelConfig: { fetchModel: async (_identity, name) => name === 'denied-model'
+        ? { ok: false, reason: 'Synthetic model admission refusal' }
+        : { ok: true, model: { ...model, id: name || model.id, name: name || model.id } } },
     })),
   });
-  installed = loadIpc(bridge).install({ app, ipcMain, BrowserWindow, identityOf,
+  let archiveLookup;
+  const ipcBridge = { ...bridge, archivedConversation: (...args) => archiveLookup
+    ? archiveLookup(...args) : bridge.archivedConversation(...args) };
+  installed = loadIpc(ipcBridge).install({ app, ipcMain, BrowserWindow, identityOf,
     // The explicit legacy shape is a negative control: the original production
     // callback returned a device key without the already-cached session.
     sendIdentityOf: legacySendIdentity ? (...args) => auth.identity(...args) : identityOf,
@@ -215,10 +220,11 @@ async function fixture(t, spec, legacySendIdentity = false) {
     }
     return result;
   }
-  return { root, app, open, send, installed, bridge, turns, memories, handlers,
+  return { root, app, open, send, installed, bridge, ipcBridge, turns, memories, handlers,
     event, listeners, frames, controls, closeWindow: () => window.emit('closed'),
     emit: (handle, kind) => nativeHandles.get(handle.ref).emit(kind),
     openInstalled: options => handlers.get('pi-session-open')(event, { capabilities: [], ...options }),
+    archiveLookup: lookup => { archiveLookup = lookup; },
     identity: () => auth.authenticatedIdentity(app), localIdentity: () => auth.identity(app),
     sessionReady: () => Boolean(auth.session(app)), enrollments: () => enrollmentCount,
     expire: () => { now += 3600 * 1000; },
@@ -424,6 +430,95 @@ test('production IPC switches Pi -> OpenCode -> Qwen -> Pi and authenticates mod
   assert.equal((await select({ ...event, senderFrame: {} }, h.ref, 'qwen')).ok, false);
   f.switchAccount(); assert.equal((await select(event, h.ref, 'qwen')).ok, false);
   assert.equal((await models(event, h.ref, 'forbidden')).ok, false); assert.equal(h.adapterId, 'pi');
+});
+
+test('production Agent IPC prepares the selected target model atomically and retains the original archive on refusal', async t => {
+  const f = await fixture(t, catalog.runtime('pi')), h = await f.open(), id = h.sessionId, ref = h.ref;
+  await f.send(h, 'Preserve the original conversation');
+  const select = f.handlers.get('pi-session-select-agent');
+  const changed = await select(f.event, ref, 'opencode', { modelName: 'chosen-target-model', allowLocal: true });
+  assert.equal(changed.ok, true, changed.reason);
+  assert.equal(h.sessionId, id); assert.equal(h.ref, ref);
+  assert.equal(h.adapterId, 'opencode');
+  assert.equal(h.snapshot().modelSelection.name, 'chosen-target-model');
+  const original = h.snapshot();
+  const denied = await select(f.event, ref, 'qwen', { modelName: 'denied-model' });
+  assert.equal(denied.ok, false);
+  assert.equal(h.sessionId, id); assert.equal(h.ref, ref);
+  assert.equal(h.adapterId, 'opencode');
+  assert.deepEqual(h.snapshot().messages, original.messages);
+  assert.equal(h.snapshot().modelSelection.name, 'chosen-target-model');
+  assert.equal(f.bridge.list().length, 1);
+});
+
+test('unreadable account projection hints do not authorize missing-conversation fallback', async t => {
+  const f = await fixture(t, catalog.runtime('pi'));
+  const result = await f.openInstalled({ chatId: 'acct-unreadable', adapterId: 'account-sync', accountConversation: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'ACCOUNT_HISTORY_UNAVAILABLE', JSON.stringify(result));
+  assert.notEqual(result.notFound, true);
+  assert.equal(f.bridge.list().length, 0); assert.deepEqual(f.turns, []);
+});
+
+test('an authenticated unreadable archive projection is unavailable rather than absent', async t => {
+  const f = await fixture(t, catalog.runtime('pi')), identity = await f.identity();
+  const row = { id: 'acct-archived', adapterId: 'account-sync', accountConversation: true,
+    accountProjection: true, owner: require('../main/platform-connections/runtime.cjs').connectionScope(identity),
+    sourceSessionId: 'remote-source', sourceClientId: 'another-device' };
+  f.archiveLookup(async (_app, id, options) => id === row.id && !options?.nativeOnly ? row : null);
+  const result = await f.openInstalled({ chatId: row.id });
+  assert.equal(result.ok, false); assert.equal(result.code, 'ACCOUNT_HISTORY_UNAVAILABLE', JSON.stringify(result));
+  assert.notEqual(result.notFound, true);
+  assert.equal(f.bridge.list().length, 0); assert.deepEqual(f.turns, []);
+});
+
+for (const deleted of [false, true]) test('a known account source ' + (deleted ? 'tombstone confirms absence' : 'read failure cannot become absence'), async t => {
+  const service = require('../main/conversation/account-sync'), create = service.create;
+  t.mock.method(service, 'create', options => ({ ...create(options),
+    isAccountConversation: id => id === 'acct-known',
+    row: async () => ({ id: 'acct-known', deleted, sourceClientId: 'another-device', sourceSessionId: 'remote-source' }),
+    openProjection: async () => null,
+  }));
+  const f = await fixture(t, catalog.runtime('pi'));
+  const result = await f.installed.open({ chatId: 'acct-known', capabilities: [] });
+  assert.equal(result.ok, false);
+  if (deleted) assert.equal(result.notFound, true, JSON.stringify(result));
+  else { assert.equal(result.code, 'ACCOUNT_HISTORY_UNAVAILABLE', JSON.stringify(result)); assert.notEqual(result.notFound, true); }
+  const foreground = await f.openInstalled({ chatId: 'acct-known' });
+  assert.equal(foreground.ok, false);
+  if (deleted) assert.equal(foreground.notFound, true, JSON.stringify(foreground));
+  else assert.notEqual(foreground.notFound, true);
+  assert.equal(f.bridge.list().length, 0); assert.deepEqual(f.turns, []);
+});
+
+test('foreground account read failures and identity changes never authorize missing-history fallback', async t => {
+  const service = require('../main/conversation/account-sync'), create = service.create;
+  let read = async () => { throw Object.assign(Error('Synthetic forbidden history'), { status: 403 }); };
+  t.mock.method(service, 'create', options => ({ ...create(options),
+    isAccountConversation: id => id === 'acct-known', row: (...args) => read(...args), openProjection: async () => null,
+  }));
+  const f = await fixture(t, catalog.runtime('pi'));
+  const forbidden = await f.openInstalled({ chatId: 'acct-known' });
+  assert.equal(forbidden.ok, false); assert.notEqual(forbidden.notFound, true);
+  assert.match(forbidden.reason, /Synthetic forbidden history/);
+  read = async () => { throw Error('Synthetic unavailable history'); };
+  const unavailable = await f.openInstalled({ chatId: 'acct-known' });
+  assert.equal(unavailable.ok, false); assert.notEqual(unavailable.notFound, true);
+  read = async () => { f.switchAccount(); return { id: 'acct-known', deleted: true }; };
+  const changed = await f.openInstalled({ chatId: 'acct-known' });
+  assert.equal(changed.ok, false); assert.notEqual(changed.notFound, true);
+  assert.match(changed.reason, /账号|服务/);
+  assert.equal(f.bridge.list().length, 0); assert.deepEqual(f.turns, []);
+});
+
+test('native archive absence remains distinct from an archive read failure', async t => {
+  const f = await fixture(t, catalog.runtime('pi'));
+  assert.equal((await f.openInstalled({ chatId: 'missing-native-archive' })).notFound, true);
+  f.archiveLookup(async () => { throw Error('Synthetic archive read failure'); });
+  const denied = await f.openInstalled({ chatId: 'unreadable-native-archive' });
+  assert.equal(denied.ok, false); assert.notEqual(denied.notFound, true);
+  assert.match(denied.reason, /Synthetic archive read failure/);
+  assert.equal(f.bridge.list().length, 0); assert.deepEqual(f.turns, []);
 });
 
 for (const spec of catalog.runtimes()) {

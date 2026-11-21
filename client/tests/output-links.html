@@ -14,7 +14,9 @@ window.soduWorkAPI={openExternal:async url=>{opens.push(url);return{ok:true}},co
  open:async opts=>{current=opts.chatId;return{ok:true,ref:current,sessionId:current,model:{},snapshot:snapshots[current]||empty()}},
  outputs:async ref=>{calls.push(ref);if(delayed&&delayed.ref===ref){const d=delayed;delayed=null;return d.promise}
    return{ok:true,artifacts:local[ref]||[]}},
- artifactAction:async(ref,id,action)=>{opens.push({ref,id,action});return{ok:true}},
+ artifactAction:async(ref,id,action)=>{opens.push({ref,id,action});return action==='image-full'
+   ? {ok:true,mimeType:'image/png',data:'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP1sAAAAASUVORK5CYII='}
+   : {ok:true}},
  release:async()=>({ok:true}),close:()=>{},cancel:()=>{},
  onEvent:fn=>{sink=fn;return()=>{sink=null}},send:async()=>({ok:true})
 }};
@@ -26,6 +28,7 @@ window.workRoot=()=>'';window.refreshHistory=()=>{};window.petSay=text=>calls.pu
 <script src="../components/panels/work-composer.js"></script>
 <script src="../components/panels/chat-dom-patch.js"></script>
 <script src="../components/panels/panels-chat-tools.js"></script>
+<script src="../components/panels/chat-media.js"></script>
 <script src="../components/panels/chat-output-links.js"></script>
 <script src="../components/panels/chat-workspace-info.js"></script><script src="../components/panels/chat-workspace-split.js"></script>
 <script src="../components/panels/chat-workspace-controls.js"></script>
@@ -104,6 +107,14 @@ ChatOutputLinks.linkify(root,[file('a','report.pdf')]);
 check('已被净化掉 href 的文件名可补链且不污染代码块',root.querySelectorAll('button').length===1&&!root.querySelector('pre button'));
 const safe=ChatOutputLinks.sanitize('<a href="javascript:alert(1)">bad</a><img src=x onerror="alert(1)">',DOMPurify);
 check('危险协议和事件仍被过滤',!safe.includes('javascript:')&&!safe.includes('onerror'));
+const media=(url,language='json')=>'\x60\x60\x60'+language+'\n'+JSON.stringify({type:'image',items:[{url}]})+'\n\x60\x60\x60';
+set('screenshot','截图已生成。\n\n'+media('font-demo.png','soduwork-media')+'\n\n'+media('../font-demo.png'));
+local.screenshot=[{...file('shot','font-demo.png'),kind:'image',primary:false,processEvidence:true}];
+await NativeChat.enter(null,'screenshot');
+check('本地媒体声明显示已授权的工作区截图',
+  await until(()=>document.querySelector('#nchatList [data-output-image="shot"] .nmedia-item')?.dataset.mediaState==='ready') &&
+  opens.some(row=>row?.ref==='screenshot'&&row?.id==='shot'&&row?.action==='image-full'));
+check('相对路径越界时不读取文件',document.querySelector('#nchatList pre')?.textContent.includes('../font-demo.png'));
 window.fixtureChecks={passed,failed,lines};window.fixtureReady=true;
 }catch(e){failed++;lines.push('FAIL '+e.stack);window.fixtureChecks={passed,failed,lines};window.fixtureReady=true}
 document.getElementById('out').textContent=lines.join('\n')+'\n\noutput links: '+passed+' passed, '+failed+' failed';

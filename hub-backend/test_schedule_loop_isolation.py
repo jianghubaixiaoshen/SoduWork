@@ -140,6 +140,30 @@ class ScheduleTickIsolationTests(unittest.IsolatedAsyncioTestCase):
         runs = list((await self.session.execute(select(models.AiScheduleRun))).scalars())
         self.assertEqual([(run.schedule_id, run.trigger) for run in runs], [("good", "timer")])
 
+    async def test_expired_retry_never_dispatches_and_extending_dates_restores_timer(self):
+        from app.api.schedule_contract import apply_schedule_update
+        now = datetime.now(timezone.utc)
+        self.good.enabled = False
+        self.bad.time_zone = "UTC"
+        self.bad.at_hour = self.bad.at_minute = 0
+        self.bad.end_date = (now - timedelta(days=1)).date().isoformat()
+        self.bad.next_retry_at = now - timedelta(seconds=30)
+        self.bad.retry_count = 1
+        await self.session.commit()
+        with patch.object(schedules, "run_one", AsyncMock(return_value={"ok": True})) as dispatch:
+            self.assertEqual((await schedules.tick(self.session))["fired"], 0)
+            dispatch.assert_not_awaited()
+        self.assertTrue(self.bad.enabled, "expiration retains the plan for later editing")
+        self.assertEqual(list((await self.session.execute(select(models.AiScheduleRun))).scalars()), [])
+        apply_schedule_update(self.bad, {"endDate": (now + timedelta(days=2)).date().isoformat()})
+        self.assertIsNone(self.bad.next_retry_at, "extension must not revive an old retry")
+        self.bad.last_run_at = now - timedelta(days=1)
+        await self.session.commit()
+        with patch.object(schedules, "run_one", AsyncMock(return_value={"ok": True})) as dispatch:
+            self.assertEqual((await schedules.tick(self.session))["fired"], 1)
+            self.assertEqual((await schedules.tick(self.session))["fired"], 0)
+            dispatch.assert_awaited_once()
+
     async def test_one_lease_error_keeps_appointment_pending_and_allows_other_plans(self):
         self.bad.every, self.bad.run_at = "once", self.good.run_at
         self.bad.time_zone = "UTC"

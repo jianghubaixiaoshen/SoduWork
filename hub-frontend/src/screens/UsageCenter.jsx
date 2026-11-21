@@ -79,7 +79,7 @@ export default function UsageCenter() {
       {error && <div className="ugc-inline-error" role="alert"><Icon name="alert" />{tx("刷新失败，正在保留上一次数据：")}{error}</div>}
       <Pulse data={data} />
       <div className="ugc-overview">
-        <TrendPanel points={data.trend || []} days={data.days || 30} />
+        <TrendPanel recent={data.recent || []} points={data.trend || []} days={data.days || 30} />
         <SceneLedger rows={data.bySource || []} total={total} selected={source} onSelect={setSource} />
       </div>
       <div className="ugc-layout">

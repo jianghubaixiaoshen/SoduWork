@@ -21,7 +21,7 @@ const METRICS = localeMap(() => ({
 }))
 const shortDate = (key) => String(key).slice(5).replace('-', '/')
 
-export function TrendPanel({ points, days }) {
+export function TrendPanel({ points, days, recent = [] }) {
   const uiLocale = useLocale();
   const rows = useMemo(() => calendarTrend(points, days), [points, days, uiLocale])
   const [metric, setMetric] = useState('tokens')
@@ -33,6 +33,14 @@ export function TrendPanel({ points, days }) {
   const values = rows.map((row) => numeric(row[metric]) / (isCost ? 1000000 : 1))
   const peak = Math.max(0, ...values)
   const sum = values.reduce((a, b) => a + b, 0)
+  const activeDays = rows.filter(row => numeric(row.sessions) > 0).length
+  const peakDay = rows[values.indexOf(peak)]?.key
+  const concentrated = rows.length > 1 && peak > 0 && peak > sum / 2
+  const dayFormat = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' })
+  const peakRecords = concentrated ? recent.filter(row => {
+    const time = Date.parse(row.occurredAt)
+    return Number.isFinite(time) && dayFormat.format(time) === peakDay
+  }) : []
   const unit = METRICS[metric].unit
   const step = 10 ** Math.floor(Math.log10(Math.max(isCost ? .01 : 1, peak / 4)))
   const rawTick = [1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10].find((n) => n * step >= peak / 4) * step
@@ -87,9 +95,15 @@ export function TrendPanel({ points, days }) {
           {labels.map((i) => <text className="ugc-plot-date" key={i} x={x(i)} y={height - 4} textAnchor={i === 0 ? 'start' : i === rows.length - 1 ? 'end' : 'middle'}>{shortDate(rows[i].key)}</text>)}
         </svg>
         {selected != null && <div className={'ugc-chart-tip ' + (selected < rows.length / 2 ? 'from-left' : 'from-right')} style={{ left: x(selected) / width * 100 + '%' }}>
-          <span>{rows[selected].key}</span><b>{isCost ? money(rows[selected].costMicrousd, rows[selected].sessions ? tx("待对账") : '—') : precise(values[selected])}<small>{isCost ? 'USD' : unit}</small></b>
+          <span>{rows[selected].key}</span><b>{isCost ? money(rows[selected].costMicrousd, rows[selected].sessions ? tx("待对账") : '—') : precise(values[selected])}<small>{' '}{isCost ? 'USD' : unit}</small></b>
           <small>{numeric(rows[selected].sessions) ? tx("{0} 条用量记录", [precise(rows[selected].sessions)]) : tx("当天暂无用量记录")}</small></div>}
       </div>}
+    {activeDays > 0 && activeDays < rows.length && <p className="ugc-chart-note">{tx("所选 {0} 天中有 {1} 天产生了记录。", [rows.length, activeDays])}</p>}
+    {concentrated && <details className="ugc-chart-note" key={peakDay}>
+      <summary>{tx("超过一半的用量集中在 {0}，查看当天的最近记录", [peakDay])}</summary>
+      {peakRecords.length ? <ul>{peakRecords.map(row => <li key={row.id}>{row.title || tx("AI 使用")} · {display(numeric(row[metric]) / (isCost ? 1000000 : 1))} {unit}</li>)}</ul>
+        : <p>{tx("最近记录中没有这一天的明细。")}</p>}
+    </details>}
     <p className="ugc-chart-note">{isCost ? tx("仅展示已知价格的成本；未计价的用量仍会计入 Token。") : tx("悬停查看每日数据，或聚焦图表后使用方向键。")}</p>
   </section>
 }

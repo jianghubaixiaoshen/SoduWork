@@ -15,6 +15,7 @@ const _distribution = require('./main/distribution.cjs');
  * Set it before any userData path consumers.
  */
 require('./main/userdata-path.cjs').initializeUserData(app);
+require('./main/requirement-diagnostics.cjs').install({app,ipcMain});
 if (require('./main/keychain-startup.cjs').dispatch({ app, BrowserWindow, shell, nativeImage })) return;
 const _hubEndpoint = require('./main/hub-endpoint.cjs');
 _hubEndpoint.initialize(app);
@@ -111,7 +112,6 @@ process.on('unhandledRejection', (reason) => {
   console.error('[SoduWork] unhandled rejection (kept alive):', reason && reason.stack || reason);
 });
 
-_deviceAuth.install({ app, ipcMain, safeStorage });
 require('./main/client-domain-cache.cjs').install({ app, ipcMain, webContents, deviceAuth: _deviceAuth,
   modelsChanged: () => _catalogChanges.changed() });
 require('./main/read-aloud.cjs').install({ app, ipcMain, BrowserWindow, getRendererRoot: rendererRoot });
@@ -128,7 +128,6 @@ const _applicationMenu = require('./main/app-menu-info.cjs').install({ app, ipcM
 const _workspaceTitlebar = require('./main/workspace-titlebar.cjs').create({ app, ipcMain, BrowserWindow, Menu,
   getRendererRoot: rendererRoot, fallbackCommand: _applicationMenu.nativeCommand,
   getWorkspace: () => { openDeskWindow({ panel: 'workspace' }, null); return _workWindows.get('workspace'); } });
-_runnerRuntime.install({ app, ipcMain, identityOf: _deviceAuth.identity });
 require('./main/agent-runtime/custom-runtimes.cjs').install({ app, ipcMain, session: _piSessions,
   runner: _runnerRuntime, BrowserWindow, dialog, changed: _catalogChanges.changed });
 async function _sessionIdentity(appRef, hub = '', clientId = '') {
@@ -296,6 +295,8 @@ const _fileOpen = _fileOpenModule.create({
   },
   identityOf: () => _sessionIdentity(app),
   ownerOf: require('./main/platform-connections/runtime.cjs').connectionScope,
+  // macOS can send files before ready, before the quit state below is initialized.
+  deferLaunch: files => app.isReady() && _quitRelaunch.deferLaunch(files),
 });
 
 
@@ -592,10 +593,19 @@ function _trayMenu() {
   ];
 }
 
+const _quitRelaunch = require('./main/quit-relaunch.cjs').create(app);
+
 function _quitSoduWork(reason) {
+  _quitRelaunch.markQuitting();
   if (tray) { tray.destroy(); tray = null; }
   _lifecycleDiagnostics.setExitReason(reason);
   app.quit();
+  if (reason === 'tray') {
+    // Background cleanup can defer quit. Let windows run their normal close handlers now.
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.close();
+    }
+  }
 }
 
 function createTray() {
@@ -631,28 +641,29 @@ if (!gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', (_event, argv, workingDirectory, additionalData) => {
-    if (_linuxStartup.focusRecovery(app)) return;
-    if (_fileOpen.enqueue(_fileOpenModule.instanceFiles(
-      argv, workingDirectory, app.isPackaged, additionalData))) return;
-    // Reveal the existing instance even when minimized or hidden.
-    if (!_desktopOverlay.window || _desktopOverlay.window.isDestroyed()) { _desktopOverlay.createWindow(); return; }
-    if (_desktopOverlay.emergency && typeof _desktopOverlay.recoverFromEmergency === 'function') { _desktopOverlay.recoverFromEmergency(); return; }
-    if (_desktopOverlay.window.isMinimized()) _desktopOverlay.window.restore();
-    if (!_desktopOverlay.window.isVisible()) _desktopOverlay.window.show();
-    _desktopOverlay.window.focus();
+    if (!_quitRelaunch.quitting && _linuxStartup.focusRecovery(app)) return;
+    const files = _fileOpenModule.instanceFiles(argv, workingDirectory, app.isPackaged, additionalData);
+    // A window opened now would close with this exiting process.
+    if (_quitRelaunch.deferLaunch(files)) return;
+    if (_fileOpen.enqueue(files)) return;
     /*
-     * On macOS, repeated application launches also restore the workspace; preserve the
-     * existing Windows activation path.
+     * Reopening the application always targets its workspace. The desktop overlay
+     * can have every entry hidden or be recovering independently; neither state
+     * should prevent restoring the workspace or change saved visibility preferences.
      */
-    if (process.platform === 'darwin') {
-      try { openDeskWindow({ panel: 'workspace' }, null); }
-      catch (e) { console.error('[second-instance] 打开主工作区失败', e); }
-    }
+    try { openDeskWindow({ panel: 'workspace' }, null); }
+    catch (e) { console.error('[second-instance] Failed to open workspace', e); }
   });
 
   _fileOpen.fromCommand(process.argv, process.cwd());
   app.whenReady().then(() => {
-    if (_linuxStartup.showRecovery({ app, BrowserWindow, safeStorage })) return;
+    if (!_linuxStartup.showRecovery({ app, BrowserWindow, safeStorage, onUnlock: startDesktop })) startDesktop();
+  });
+
+  function startDesktop(credentials) {
+    _deviceAuth.install({ app, ipcMain, safeStorage, credentials, onAuthUnavailable: _runnerRuntime.pauseForHubChange });
+    _runnerRuntime.install({ app, ipcMain, identityOf: _deviceAuth.identity, sessionOf: _deviceAuth.session,
+      canConnect: _deviceAuth.canConnect });
     /*
      * Adopt the Runner-managed office engine so client probes and child processes use the same
      * installation. Missing engines must not block startup.
@@ -715,6 +726,7 @@ if (!gotTheLock) {
     app.on('activate', () => {
       /* Apply this activation behavior only on macOS. */
       if (process.platform === 'darwin') {
+        if (_quitRelaunch.deferLaunch()) return;
         if (BrowserWindow.getAllWindows().length === 0) _desktopOverlay.createWindow();
 
 
@@ -735,7 +747,7 @@ if (!gotTheLock) {
         _desktopOverlay.createWindow();
       }
     });
-  });
+  }
 }
 
 app.on('window-all-closed', () => {

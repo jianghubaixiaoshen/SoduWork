@@ -160,7 +160,9 @@
             ? '在 Discord 选择 /pair，将配对码填入 code 参数；成功后用 /soduwork 的 text 参数发送任务指令。'
             : connection.provider === 'telegram'
               ? '配对成功后，私聊可直接发送任务指令；群聊请使用 /soduwork@机器人名 加任务内容。'
-              : '群聊请按平台要求 @机器人。配对成功后即可发送任务指令。';
+              : connection.provider === 'wecom'
+                ? '在目标企微私聊中发送此命令。配对成功后即可在该私聊发送任务指令。'
+                : '群聊请按平台要求 @机器人。配对成功后即可发送任务指令。';
           view.status.textContent = '命令有效期 ' + Math.ceil(pair.expiresIn / 60) + ' 分钟，仅可使用一次。' + instructions;
         }));
         function changeTarget() {
@@ -201,7 +203,11 @@
             button('解除绑定', () => view.run(async () => { await api.im.unbind(item.id, view.options()); if (view.active()) inspect(connection); }))); view.body.append(row);
         }
         view.body.append(el('b', '最近消息'));
-        if (!messages.messages?.length) view.body.append(el('p', '还没有收到手机消息。', 'connector-inline-note'));
+        if (!messages.messages?.length) view.body.append(el('p', connection.provider === 'wecom' ? '尚无进入任务的消息。' : '还没有收到手机消息。', 'connector-inline-note'));
+        if (connection.provider === 'wecom' && messages.sawUnpairedMessage === true) {
+          view.body.append(el('p', '此连接收到过来自未配对会话的消息。要让某个私聊的消息进入任务，请点击「绑定任务」→ 选择执行电脑 → 在目标企微私聊发送一次性配对命令。', 'connector-inline-note'),
+            button('绑定任务', () => { if (view.active()) chooseTask(connection); }));
+        }
         for (const item of messages.messages || []) {
           const row = el('div', undefined, 'im-message');
           row.append(el('p', (statuses[item.status] || '状态待检查') + ' · ' + new Date(item.createdAt).toLocaleString()), el('p', detailText(item.detail), 'connector-inline-note'));

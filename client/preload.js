@@ -1,4 +1,5 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
+let requirementDiagnosticsEnabled;
 
 const pageIpcEvents = [];
 let pageIpcEpoch = 0;
@@ -85,7 +86,7 @@ const conversationSession = {
   send: (ref, text, attachments, options) => ipcRenderer.invoke('pi-session-send', ref, text, attachments || [], options || {}),
   cancelQueued: (ref, id) => ipcRenderer.invoke('pi-session-queue-cancel', ref, id),
   updateQueue: (ref, id, action, value) => ipcRenderer.invoke('pi-session-queue-update', ref, id, action, value),
-  selectAgent: (ref, agentId) => ipcRenderer.invoke('pi-session-select-agent', ref, agentId),
+  selectAgent: (ref, agentId, selection) => ipcRenderer.invoke('pi-session-select-agent', ref, agentId, selection),
   conversationRuntimes: (ref, options) => ipcRenderer.invoke('pi-session-conversation-runtimes', ref, options || {}),
   selectModel: (ref, name) => ipcRenderer.invoke('pi-session-select-model', ref, name),
   setThinking: (ref, value) => ipcRenderer.invoke('pi-session-set-thinking', ref,
@@ -191,7 +192,6 @@ const workPreview = {
   onComposerInbox: (cb) => ipcRenderer.on('work-preview-composer-inbox', (_e, msg) => { try { cb(msg || {}); } catch (_) {} }),
   onComposerHello: (cb) => ipcRenderer.on('work-preview-composer-hello', (_e, msg) => { try { cb(msg || {}); } catch (_) {} }),
   onComposerRefresh: (cb) => ipcRenderer.on('work-preview-composer-refresh', (_e, msg) => { try { cb(msg || {}); } catch (_) {} }),
-  composerState: (payload) => ipcRenderer.invoke('work-preview-composer-state', payload || {}),
   composerTurnSettled: () => ipcRenderer.invoke('work-preview-composer-turn-settled'),
   composerSubmitResult: payload => ipcRenderer.invoke('work-preview-composer-submit-result', payload),
   authorizeComposerAutomation: id => ipcRenderer.invoke('work-preview-composer-automation-authorize',id),
@@ -309,6 +309,10 @@ ipcRenderer.on('overlay-window-blur', (_event, revision) => {
 });
 
 const soduWorkBridge = {
+  recordRequirementDiagnostic: (event, data) => {
+    requirementDiagnosticsEnabled ||= Promise.resolve(ipcRenderer.invoke('requirement-diagnostics-enabled')).catch(() => false);
+    void requirementDiagnosticsEnabled.then(enabled => { if(enabled) ipcRenderer.send('requirement-diagnostics-record',event,data); }).catch(() => {});
+  },
   pagePerformance: {
     snapshot: () => { trimPageIpcEvents(); return { available: true, events: pageIpcEvents.map(row => ({ ...row })) }; },
     clear: () => { pageIpcEpoch++; pageIpcEvents.length = 0; },
@@ -322,6 +326,7 @@ const soduWorkBridge = {
   moveWindow: (x, y) => ipcRenderer.send('window-move', x, y),
   setIgnoreMouseEvents: (ignore, opts) => ipcRenderer.send('window-set-ignore-mouse-events', ignore, opts),
   setOverlayShape: sendOverlayShape,
+  setOverlayDragging: (dragging) => ipcRenderer.send('window-set-overlay-dragging', !!dragging),
   getOverlayShape: () => Promise.resolve(ipcRenderer.invoke('window-get-overlay-shape')).then(observeOverlayShapeState),
   getWindowBounds: () => ipcRenderer.invoke('window-get-bounds'),
   getScreenSize: () => ipcRenderer.invoke('screen-get-size'),
@@ -346,6 +351,7 @@ const soduWorkBridge = {
   selectHubEnvironment: (hub) => ipcRenderer.invoke('hub-environment-select', hub || ''),
   runtimeForm: () => { try { return ipcRenderer.sendSync('runtime-form'); } catch (e) { return 'packaged'; } },
   deviceAuthBootstrap: (payload) => timedPageInvoke('device-auth-bootstrap', payload || {}),
+  deviceAuthMigrateLegacy: payload => timedPageInvoke('device-auth-migrate-legacy', payload),
   clientDomainRead: (domain, scope) => timedPageInvoke('client-domain-read', domain, scope),
   clientDomainInvalidate: (domain, scope) => ipcRenderer.invoke('client-domain-invalidate', domain, scope),
   onClientDomainChanged: callback => {
@@ -446,6 +452,13 @@ const soduWorkBridge = {
     get: () => ipcRenderer.invoke('local-models-get'),
     save: input => ipcRenderer.invoke('local-models-save', input || {}),
     test: (providerId, modelName) => ipcRenderer.invoke('local-models-test', String(providerId || ''), String(modelName || '')),
+    checkCapabilities: input => ipcRenderer.invoke('local-models-capabilities-check', input || {}),
+    cancelCapabilities: input => ipcRenderer.invoke('local-models-capabilities-cancel', input || {}),
+    onCapabilityProgress: fn => {
+      const handler = (_event, value) => { try { fn(value); } catch (_) {} };
+      ipcRenderer.on('local-models-capabilities-progress', handler);
+      return () => ipcRenderer.removeListener('local-models-capabilities-progress', handler);
+    },
   },
   localAgentModels: {
     get: input => ipcRenderer.invoke('local-agent-models-get', input || {}),

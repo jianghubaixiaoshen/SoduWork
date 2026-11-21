@@ -38,6 +38,8 @@ if (typeof electron === 'string') {
     modelNames: ['shared-model'], modelDefs: [{ name: 'shared-model', label: 'Shared model', modality: 'chat' }],
   })), myModels: [], usable: ['company-first', 'company-second'].map(providerId => ({
     providerId, name: 'shared-model', label: 'Shared model', keyFrom: 'org' })), mediaUsable: {} };
+  managed.providers.push({id:'custom-personal-fixture', name:'Personal Hub service', personal:true,
+    baseUrl:'https://personal.example.invalid/v1', kind:'openai-compat', modelNames:[], modelDefs:[]});
   let win, server, hub, localId, holdLocalSaves = false, failedHubWrites = 0;
   const pendingLocalSaves = [];
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -177,7 +179,13 @@ if (typeof electron === 'string') {
     await fill('[data-purl]', 'http://127.0.0.1:1/v1');
     await fill('[data-pkey]', key); await click('[data-mdeditor] summary');
     await fill('[data-padd]', 'shared-model'); await fill('[data-mdlabel]', 'Local model'); await click('[data-madd]');
-    await assertLocalCount(1); await js('window.pickerRefreshFailures=1'); await click('#mdSave'); await saved(1);
+    assert.equal(store.get().revision, 0, 'Add model cannot save a service draft');
+    await assertLocalCount(0);
+    await js('window.pickerRefreshFailures=1'); await click('#mdSave');
+    await until('_mdLoadState==="ready"&&!_mdSaveFlight&&_mdData.localRevision===1');
+    assert.equal(store.get().myModels.length, 0, 'Saving the service leaves the model form unsubmitted');
+    assert.equal(await js('document.querySelector("[data-padd]").value'), 'shared-model');
+    await click('[data-madd]'); await saved(2);
     assert.equal(await js('notices.some(message=>message.includes("模型配置已保存"))'), true);
     assert.equal(await js('notices.some(message=>message.includes("没存上"))'), false);
     await js('window.pickerRefreshFailures=0');
@@ -193,14 +201,14 @@ if (typeof electron === 'string') {
     assert.equal(await js('document.querySelector("[data-pkey]").value'), '');
     await click('[data-mdedit]'); await fill('[data-mdlabel]', 'Edited local label'); await click('[data-madd]');
     assert.equal(await js('_mdMyModels.find(row=>row.localOnly).label'), 'Edited local label');
-    await click('#mdSave'); await saved(2);
+    await click('#mdSave'); await saved(3);
     assert.equal(store.get().myModels[0].label, 'Edited local label');
     record('Reload and same-ID editing retain one local row without treating its mirror as a duplicate');
 
     await click('[data-mdedit]'); await fill('[data-padd]', 'renamed-local-model'); await click('[data-madd]');
     await assertLocalCount(1);
     assert.equal(await js('document.querySelector(".md-model-list").textContent.includes("shared-model")'), false);
-    await click('#mdSave'); await saved(3);
+    await click('#mdSave'); await saved(4);
     assert.equal(store.get().myModels[0].name, 'renamed-local-model');
     await js('document.querySelector(".md-model-row").scrollIntoView({block:"center"})'); await delay(80);
     const localCredentials = await js('document.querySelector(".md-credentials").innerText');
@@ -215,6 +223,8 @@ if (typeof electron === 'string') {
       await click('[data-mdselect="' + id + '"]');
       assert.equal(await js('document.querySelectorAll(".md-model-row").length'), 1);
       assert.equal(await js('document.querySelectorAll("[data-mdedit]").length'), 0);
+      assert.equal(await js('document.querySelector(".md-settings-section input").readOnly'), true);
+      assert.equal(await js('document.querySelector("[data-purl]")'), null);
       assert.equal(await js('document.querySelector(".md-model-list").textContent.includes("Shared model")'), true);
     }
     record('Identical model names from separate Hub providers remain visible and organization-managed');
@@ -223,7 +233,7 @@ if (typeof electron === 'string') {
     await fill('[data-mdlabel]', 'Draft for removed model');
     await js('window.removedEditor=document.querySelector("[data-mdeditor]");window.removedApply=removedEditor.querySelector("[data-madd]");');
     holdLocalSaves = true; await click('[data-mdel]'); await waitForLocalSave();
-    assert.equal(store.get().revision, 3, 'the deletion has not reached the production store');
+    assert.equal(store.get().revision, 4, 'the deletion has not reached the production store');
     assert.equal(store.get().myModels.length, 1);
     assert.equal(await js('document.getElementById("mdSave").disabled'), true);
     assert.equal(await js('_mdSave(false)===_mdSave(false)'), true, 'reentrant saves share the pending operation');
@@ -233,7 +243,7 @@ if (typeof electron === 'string') {
     await js('removedApply.click();removedEditor.querySelector("[data-padd]").dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));');
     assert.equal(await js('_mdMyModels.length'), 0, 'detached callbacks cannot reinsert a removed model during save');
     releaseLocalSaves();
-    await until('_mdLoadState==="ready"&&!_mdDirty&&_mdData.localRevision>=4'); await assertLocalCount(0);
+    await until('_mdLoadState==="ready"&&!_mdDirty&&_mdData.localRevision>=5'); await assertLocalCount(0);
     assert.equal(store.get().myModels.length, 0);
     assert.equal(store.get().providers.length, 1);
     assert.equal(store.get().providers[0].keySet, true, 'model removal preserves its provider credential');
@@ -247,14 +257,14 @@ if (typeof electron === 'string') {
     for (const name of ['retained-model', 'removed-sibling']) {
       await click('[data-mdeditor] summary'); await fill('[data-padd]', name); await click('[data-madd]');
     }
-    await click('#mdSave'); await until('_mdLoadState==="ready"&&!_mdDirty&&_mdData.localRevision>=5');
+    await until('_mdLoadState==="ready"&&!_mdDirty&&_mdData.localRevision===7');
     await assertLocalCount(2);
     await click('[data-mdedit="' + localId + '|0"]'); await fill('[data-mdlabel]', 'Retained unsaved label');
-    await click('[data-mdel="' + localId + '|1"]'); await saved(6);
+    await click('[data-mdel="' + localId + '|1"]'); await saved(8);
     assert.equal(await js('document.querySelector("[data-padd]").value'), 'retained-model');
     assert.equal(await js('document.querySelector("[data-mdlabel]").value'), 'Retained unsaved label');
     assert.equal(await js(`_mdDrafts.get(${JSON.stringify(localId)}).original`), 'retained-model');
-    await click('[data-madd]'); await click('#mdSave'); await saved(7);
+    await click('[data-madd]'); await click('#mdSave'); await saved(9);
     assert.equal(store.get().myModels[0].label, 'Retained unsaved label');
     record('Deleting another row preserves the current edit draft and its unsaved fields through save and reload');
 
@@ -263,14 +273,14 @@ if (typeof electron === 'string') {
     await js('window.providerEditor=document.querySelector("[data-mdeditor]");window.providerApply=providerEditor.querySelector("[data-madd]");');
     await until('document.querySelector("[data-md-delete-confirm]")?.disabled===false');
     holdLocalSaves = true; await click('[data-md-delete-confirm]'); await waitForLocalSave();
-    assert.equal(store.get().revision, 7, 'provider deletion is inspected before persistence');
+    assert.equal(store.get().revision, 9, 'provider deletion is inspected before persistence');
     assert.equal(store.get().providers.length, 1);
     assert.equal(await js('providerEditor.isConnected'), true);
     assert.equal(await js(`_mdDrafts.has(${JSON.stringify(localId)})`), true);
     await js('providerApply.click()');
     assert.equal(await js('_mdMyModels.length'), 1);
     releaseLocalSaves();
-    await until('_mdLoadState==="ready"&&!_mdDirty&&_mdData.localRevision>=8');
+    await until('_mdLoadState==="ready"&&!_mdDirty&&_mdData.localRevision>=10');
     assert.equal(store.get().providers.length, 0); assert.equal(store.get().myModels.length, 0);
     assert.equal(await js(`!!document.querySelector('[data-mdselect="${localId}"]')`), false);
     assert.equal(await js('window.soduWorkAPI.getCloseDeskWindowCalls()'), 0, 'confirmed provider removal must not close the workspace window');
@@ -285,23 +295,24 @@ if (typeof electron === 'string') {
     const mixedLocalId = await js('document.querySelector("[data-pname]").dataset.pname');
     await fill('[data-pname]', 'Mixed local service'); await fill('[data-purl]', 'http://127.0.0.1:2/v1');
     await fill('[data-pkey]', key);
-    await click('[data-mdselect="company-first"]'); await fill('[data-purl]', 'https://managed-retry.invalid/v1');
+    await click('[data-mdselect="custom-personal-fixture"]'); await fill('[data-purl]', 'https://managed-retry.invalid/v1');
     failedHubWrites = 1; await js('notices.length=0'); await click('#mdSave');
     await until('!_mdSaveFlight&&_mdManagedDirty&&!_mdLocalDirty');
     assert.equal(hubWrites.length, 1);
-    assert.equal(store.get().revision, 9);
+    assert.equal(store.get().revision, 11);
     assert.equal(store.get().providers[0].name, 'Mixed local service');
     assert.equal(store.get().providers[0].keySet, true);
-    assert.equal(await js('_mdData.localRevision'), 9);
+    assert.equal(await js('_mdData.localRevision'), store.get().revision);
     assert.equal(await js('notices.includes("本地模型配置已保存，Hub 模型配置未保存，请重试。")'), true);
     assert.equal(await js('document.getElementById("mdSave").disabled'), false);
     await click('#mdSave'); await until('!_mdSaveFlight&&_mdLoadState==="ready"&&!_mdDirty');
     assert.equal(hubWrites.length, 2);
-    assert.equal(store.get().revision, 9, 'retry must not replay the already committed local save');
-    assert.equal(managed.providers[0].baseUrl, 'https://managed-retry.invalid/v1');
+    assert.equal(store.get().revision, 11, 'retry must not replay the already committed local save');
+    assert.equal(managed.providers.find(row => row.id === 'custom-personal-fixture').baseUrl, 'https://managed-retry.invalid/v1');
     await win.loadURL(desk); await until('_mdLoadState==="ready"');
     assert.equal(await js(`_mdData.providers.find(row=>row.id===${JSON.stringify(mixedLocalId)}).name`), 'Mixed local service');
-    assert.equal(await js('_mdData.providers.find(row=>row.id==="company-first").baseUrl'), 'https://managed-retry.invalid/v1');
+    await click('[data-mdselect="custom-personal-fixture"]');
+    assert.equal(await js('document.querySelector("[data-purl]").value'), 'https://managed-retry.invalid/v1');
     record('Mixed local and managed edits report partial success and retry only the uncommitted Hub save');
 
     for (const body of hubWrites) {
@@ -311,7 +322,7 @@ if (typeof electron === 'string') {
       assert.equal(JSON.stringify(body).includes('Mixed local service'), false);
       assert.equal(JSON.stringify(body).includes('127.0.0.1'), false);
       assert.deepEqual(body.models, []); assert.deepEqual(body.keys, {});
-      assert.deepEqual(body.providers.map(provider => provider.id), ['company-first', 'company-second']);
+      assert.deepEqual(body.providers.map(provider => provider.id), ['custom-personal-fixture']);
       assert.ok(!Object.keys(body).some(name => name.startsWith('local')));
     }
     assert.deepEqual(blocked, []); assert.deepEqual(await js('errors'), []);

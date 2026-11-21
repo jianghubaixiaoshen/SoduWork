@@ -184,7 +184,7 @@ async def put_agent_model(
     """
     key = str(body.get("key") or "").strip().lower()
     if key not in agent_setup._SPECS:
-        raise HTTPException(status_code=404, detail="没有这个 AI 助手")
+        raise HTTPException(status_code=404, detail="该执行底座已不可用，请选择其他底座")
     name = str(body.get("model") or "").strip()[:160]
     if name and (AGENTS.get(key) or {}).get("modelMode") != "managed":
         raise HTTPException(status_code=422, detail="该底座使用独立账号模型，不能选择 Hub 模型")
@@ -215,7 +215,7 @@ async def post_agent_install(
     key = str(body.get("key") or "").strip()
     action = str(body.get("action") or "install").strip()
     if key not in agent_setup._SPECS:
-        raise HTTPException(status_code=404, detail="没有这个 AI 助手")
+        raise HTTPException(status_code=404, detail="该执行底座已不可用，请选择其他底座")
     if action not in ("install", "update", "uninstall", "check", "login", "login-isolated", "login-cancel") or (action.startswith("login") and key != "codex"):
         raise HTTPException(status_code=400, detail="不认识的操作")
     if action == "uninstall" and key == "pi":
@@ -260,7 +260,7 @@ async def post_agent_probe(
     """
     key = str(body.get("key") or "").strip()
     if key not in agent_setup._SPECS:
-        raise HTTPException(status_code=404, detail="没有这个 AI 助手")
+        raise HTTPException(status_code=404, detail="该执行底座已不可用，请选择其他底座")
     # Native account runtimes choose their own model. Do not send managed keys
     # or claim that an unused company model was exercised by their probe.
     llm = (await model_catalog.resolve_for_agent(session, client, key, str(body.get("model") or ""))
@@ -285,7 +285,7 @@ async def post_agent_configure(
     """
     key = str(body.get("key") or "").strip()
     if key not in agent_setup._SPECS:
-        raise HTTPException(status_code=404, detail="没有这个 AI 助手")
+        raise HTTPException(status_code=404, detail="该执行底座已不可用，请选择其他底座")
     llm = (await model_catalog.resolve_for_agent(session, client, key, str(body.get("model") or ""))
            if (AGENTS.get(key) or {}).get("modelMode") == "managed" else {})
     runner = _pick_runner(client, body.get("runnerId"))
@@ -303,16 +303,30 @@ async def get_my_git(
     """Return the client's Git identity, masked credential metadata, and configured repository URLs
     suitable for a connection probe.
     """
-    from sqlalchemy import select
+    from sqlalchemy import or_, select
 
-    from ..models import Repo
-    from ..services import code_creds
-    repos = (await session.execute(select(Repo))).scalars().all()
-    return {
-        "git": code_creds.api_view(client),
-        "repos": [{"id": r.id, "name": r.name, "url": r.git_url}
-                  for r in repos if (r.git_url or "").strip()],
-    }
+    from ..models import Project, Repo, User
+    from ..services import code_creds, rbac
+    from ..services.repo_urls import git_probe_url
+
+    result = {"git": code_creds.api_view(client), "repos": []}
+    user = await session.get(User, client.user_ref) if client.user_ref else None
+    if not user or not user.is_active or user.account_deleted_at:
+        return result
+
+    scope = await rbac.scope_org_ids(session, user)
+    query = select(Repo.id, Repo.name, Repo.git_url).join(Project, Repo.project_id == Project.id)
+    if scope is not None:
+        # A legacy NULL repository org does not make its private parent project public.
+        query = query.where(
+            or_(Repo.org_id.is_(None), Repo.org_id.in_(scope)),
+            or_(Project.org_id.is_(None), Project.org_id.in_(scope)),
+        )
+    for repo in await session.execute(query):
+        url = git_probe_url(repo.git_url)
+        if url:
+            result["repos"].append({"id": repo.id, "name": repo.name, "url": url})
+    return result
 
 
 @router.put("/my-git")

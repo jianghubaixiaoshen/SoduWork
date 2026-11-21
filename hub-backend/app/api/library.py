@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
 from ..config import get_settings
+from ..pagination import PageQuery
 from ..db import get_session
 from ..deps import current_client
 from ..library_models import LibraryFolder, LibraryItem
@@ -142,7 +143,9 @@ def _owner_key(client: Client) -> str:
 
 
 def _safe_name(value: str, fallback: str = "未命名资料") -> str:
-    name = str(value or "").replace("\\", "/").rsplit("/", 1)[-1]
+    if value is not None and not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="名称必须是字符串")
+    name = (value or "").replace("\\", "/").rsplit("/", 1)[-1]
     name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip()
     return name[:240] or fallback
 
@@ -314,6 +317,13 @@ async def _owned_item(session, owner, item_id, include_deleted: bool = False):
 def _max_bytes():
     configured = int(get_settings().library_max_mb or 0)
     return configured * 1024 * 1024 if configured > 0 else None
+
+
+_LOSSY_OFFICE_EDITS = {
+    "spreadsheet": "XLSX 工作簿不支持在线编辑内容；请下载文件并使用电子表格应用编辑",
+    "legacy_document": "DOCX 文档不支持在线编辑内容；请下载文件并使用文字处理应用编辑",
+    "presentation": "PPTX 演示文稿不支持在线编辑内容；请下载文件并使用演示文稿应用编辑",
+}
 
 
 def _document_text_format(body: dict) -> str:
@@ -575,7 +585,8 @@ async def batch_share_library_folders(
 async def list_library(scope: str = Query("recommended"), query: str = Query(""),
                        folder_id: str = Query("", alias="folderId"),
                        storage: str = Query(""),
-                       client: Client = Depends(current_client), session: AsyncSession = Depends(get_session)):
+                       client: Client = Depends(current_client), session: AsyncSession = Depends(get_session),
+                       window: PageQuery = None):
     # Viewing any library scope is also a storage health check.  Returning an
     # empty list while MinIO is missing makes an operational failure look like
     # a valid empty library and prevents the user from fixing the deployment.
@@ -604,9 +615,15 @@ async def list_library(scope: str = Query("recommended"), query: str = Query("")
         folder_clauses.append(LibraryFolder.name.ilike(pattern))
     folders = []
     folder_api_rows = []
+    folder_total = 0
     if scope in {"all", "folders", "favorites"}:
-        folders = (await session.execute(select(LibraryFolder).where(*folder_clauses)
-                   .order_by(LibraryFolder.name.asc(), LibraryFolder.id.asc()).limit(500))).scalars().all()
+        folder_query = select(LibraryFolder).where(*folder_clauses).order_by(LibraryFolder.name, LibraryFolder.id)
+        if window:
+            folder_total = await window.total(session, folder_query)
+            folder_query = window.window(folder_query)
+        else:
+            folder_query = folder_query.limit(500)
+        folders = (await session.scalars(folder_query)).all()
         if folders:
             folder_ids = [row.id for row in folders]
             child_clauses = [LibraryFolder.owner_key == owner, LibraryFolder.parent_id.in_(folder_ids)]
@@ -656,13 +673,22 @@ async def list_library(scope: str = Query("recommended"), query: str = Query("")
         order = (LibraryItem.updated_at.desc(), LibraryItem.created_at.desc(), LibraryItem.id.desc())
     else:
         order = (LibraryItem.title.asc(), LibraryItem.id.asc())
-    items = [] if scope == "folders" else (await session.execute(
-        select(LibraryItem).where(and_(*clauses)).order_by(*order).limit(500))).scalars().all()
+    items = []
+    total = folder_total
+    if scope != "folders":
+        item_query = select(LibraryItem).where(*clauses).order_by(*order)
+        if window:
+            total += await window.total(session, item_query)
+            # Folders precede files in the same listing, including across a page boundary.
+            item_query = item_query.offset(max(0, window.offset - folder_total)).limit(window.limit - len(folders))
+        else:
+            item_query = item_query.limit(500)
+        items = (await session.scalars(item_query)).all()
     trash_clauses = [LibraryItem.owner_key == owner, LibraryItem.deleted_at.is_not(None)]
     if backend_filter:
         trash_clauses.append(LibraryItem.backend == backend_filter)
     trash_count = (await session.execute(select(func.count(LibraryItem.id)).where(*trash_clauses))).scalar_one()
-    return {"ok": True, "scope": scope, "folder": _folder_api(folder) if folder and scope != "trash" else None,
+    return {**({"total": total} if window else {}), "ok": True, "scope": scope, "folder": _folder_api(folder) if folder and scope != "trash" else None,
             "folders": folder_api_rows or [_folder_api(row) for row in folders],
             "items": [] if scope == "folders" else [_item_api(row) for row in items],
             "trashCount": int(trash_count or 0), "storage": backend_filter}
@@ -970,6 +996,11 @@ async def _update_library_item(item_id, body, client, session):
             raise HTTPException(400, "此资料类型不支持在线编辑")
         try:
             export_kind, text_format = library_formats.editor_format(row.kind, row.filename, row.content_type)
+            if export_kind in _LOSSY_OFFICE_EDITS:
+                # The text editor reads only plain text (the active worksheet,
+                # body paragraphs or slide text). Exporting that text builds a
+                # new package and discards tables, images, formulas and notes.
+                raise ValueError(_LOSSY_OFFICE_EDITS[export_kind])
             data, suffix, content_type = await asyncio.to_thread(
                 library_formats.export, export_kind, next_title, str(body.get("content") or ""), text_format
             )

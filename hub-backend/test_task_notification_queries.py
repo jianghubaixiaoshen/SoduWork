@@ -89,9 +89,15 @@ class TaskNotificationQueryTests(unittest.IsolatedAsyncioTestCase):
 
                     app.dependency_overrides[current_client] = identity
                     app.dependency_overrides[get_session] = db
-                    statements = []
-                    event.listen(engine.sync_engine, "before_cursor_execute",
-                                 lambda _c, _u, sql, _p, _x, _m: statements.append(sql))
+                    statements, bindings, limits = [], [], []
+
+                    def capture(_connection, _cursor, sql, _parameters, context, _many):
+                        statements.append(sql)
+                        bindings.append([dict(row) for row in context.compiled_parameters or []])
+                        clause = getattr(getattr(context.compiled, "statement", None), "_limit_clause", None)
+                        limits.append(getattr(clause, "value", None))
+
+                    event.listen(engine.sync_engine, "before_cursor_execute", capture)
                     sent = []
 
                     async def publish(device, payload, *, user_id):
@@ -102,24 +108,62 @@ class TaskNotificationQueryTests(unittest.IsolatedAsyncioTestCase):
                         ("create", "PUT", {"title": "One requirement", "visibility": "organization"}),
                         ("edit", "PATCH", {"title": "Edited requirement"}),
                         ("replay", "PUT", {"title": "Edited requirement"}),
-                        ("edit-versioned", "PATCH", {"title": "Versioned edit", "requirementVersion": 3}),
+                        ("replay-carried", "PUT", {"title": "Edited requirement"}),
+                        ("edit-versioned", "PATCH", {"title": "Versioned edit", "requirementVersion": 4}),
                     ]
                     with patch.object(task_access.hub, "publish", new=AsyncMock(side_effect=publish)):
                         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
                                                      base_url="http://fixture") as http:
                             for name, method, body in operations:
                                 statements.clear()
+                                bindings.clear()
+                                limits.clear()
                                 sent.clear()
                                 response = await http.request(method, "/api/v1/tasks/query-task", json=body)
                                 self.assertEqual(response.status_code, 200, response.text)
                                 self.assertEqual(response.json()["id"], "query-task")
                                 self.assertEqual(sent, [], "save must not deliver notifications inline")
-                                counts[devices, name] = len(statements)
-                                self.assertLessEqual(len(statements), {
-                                    "create": 16, "edit": 8, "replay": 9, "edit-versioned": 9}[name])
+                                definition_inserts = [index for index, sql in enumerate(statements)
+                                    if sql.lstrip().lower().startswith("insert into task_event ")]
+                                definition_reads = [index for index, sql in enumerate(statements)
+                                    if sql.lstrip().lower().startswith("select task_event.id")]
+                                self.assertEqual(len(definition_inserts), 1, (name, statements))
+                                self.assertEqual(len(definition_reads), {"replay": 1, "replay-carried": 2}.get(name, 0))
+                                inserted = bindings[definition_inserts[0]]
+                                self.assertEqual(len(inserted), 1)
+                                self.assertEqual(inserted[0]["kind"], "requirement.definition")
+                                self.assertEqual(inserted[0]["task_id"], "query-task")
+                                self.assertEqual(inserted[0]["detail"]["requirementVersion"], response.json()["requirementVersion"])
+                                for index in definition_reads:
+                                    sql, parameters = statements[index], bindings[index][0]
+                                    self.assertIn("WHERE task_event.", sql)
+                                    self.assertIn("task_event.task_id =", sql)
+                                    self.assertIn("task_event.kind =", sql)
+                                    self.assertIn("LIMIT", sql)
+                                    self.assertNotIn("ORDER BY", sql)
+                                    self.assertIn("query-task", parameters.values())
+                                    self.assertIn("requirement.definition", parameters.values())
+                                    self.assertIn("schemaVersion", parameters.values())
+                                    self.assertIn("contentHash", parameters.values())
+                                    self.assertEqual(parameters["param_1"], 1)
+                                    if index == definition_reads[0]:
+                                        self.assertIn("requirementVersion", parameters.values())
+                                        self.assertEqual(parameters["param_2"], response.json()["requirementVersion"] - 1)
+                                        self.assertEqual(parameters["param_3"], inserted[0]["detail"]["contentHash"])
+                                        self.assertEqual(limits[index], 2)
+                                    else:
+                                        self.assertIn("task_event.id =", sql)
+                                        self.assertEqual(parameters["id_1"], inserted[0]["detail"]["sourceDefinitionId"])
+                                        self.assertEqual(parameters["param_2"], inserted[0]["detail"]["contentHash"])
+                                        self.assertEqual(limits[index], 1)
+                                excluded = set(definition_inserts + definition_reads)
+                                foreground = [sql for index, sql in enumerate(statements) if index not in excluded]
+                                counts[devices, name] = len(foreground)
+                                self.assertLessEqual(len(foreground), {
+                                    "create": 16, "edit": 8, "replay": 9, "replay-carried": 9, "edit-versioned": 9}[name])
                                 if name != "create":
                                     history_queries = []
-                                    for sql in statements:
+                                    for sql in foreground:
                                         self.assertFalse(any(table in sql for table in ("memory_record", "org_unit")), sql)
                                         if any(table in sql for table in (
                                                 "task_event", "automation_execution_session",
@@ -133,6 +177,8 @@ class TaskNotificationQueryTests(unittest.IsolatedAsyncioTestCase):
                                     self.assertLessEqual(len(history_queries), 2,
                                         "Only the write guard and returned edit permission need execution facts")
                                 statements.clear()
+                                bindings.clear()
+                                limits.clear()
                                 self.assertTrue(await task_notifications.run_once(sessions))
                                 self.assertEqual(len(sent), devices)
                                 self.assertEqual({row[1]["task"]["id"] for row in sent}, {"query-task"})
@@ -147,7 +193,7 @@ class TaskNotificationQueryTests(unittest.IsolatedAsyncioTestCase):
                                     if clients[int(device[1:])].user_ref != "u0":
                                         self.assertFalse(payload["task"]["canViewExecution"])
                                         self.assertNotIn("workRouting", payload["task"])
-        for name in ("create", "edit", "replay", "edit-versioned"):
+        for name in ("create", "edit", "replay", "replay-carried", "edit-versioned"):
             self.assertLessEqual(counts[375, name], counts[10, name] + 8)
             self.assertLessEqual(counts[375, name + "-background"], counts[10, name + "-background"] + 8)
         print("Foreground/background SQL counts:", counts)

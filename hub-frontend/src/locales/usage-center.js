@@ -1,5 +1,8 @@
 // Authored usage and cost labels. Runtime names and business data stay unchanged.
 export default {
+  "所选 {0} 天中有 {1} 天产生了记录。": "Activity was recorded on {1} of {0} days.",
+  "超过一半的用量集中在 {0}，查看当天的最近记录": "Over half of this metric falls on {0}. View recent records for that day",
+  "最近记录中没有这一天的明细。": "No entries for this day in the recent records.",
   "0 分钟": "0 minutes",
   "< 1 分钟": "< 1 minute",
   "AI 使用": "AI usage",
@@ -108,6 +111,9 @@ export default {
 }
 
 export const ja = {
+  "所选 {0} 天中有 {1} 天产生了记录。": "選択した {0} 日のうち {1} 日に記録があります。",
+  "超过一半的用量集中在 {0}，查看当天的最近记录": "{0} に半分以上が集中しています。当日の最近の記録を表示",
+  "最近记录中没有这一天的明细。": "最近の記録にこの日の明細はありません。",
   "0 分钟": "0 分",
   "< 1 分钟": "1分未満",
   "AI 使用": "AI の利用",
@@ -216,6 +222,9 @@ export const ja = {
 }
 
 export const ko = {
+  "所选 {0} 天中有 {1} 天产生了记录。": "선택한 {0}일 중 {1}일에 기록이 있습니다.",
+  "超过一半的用量集中在 {0}，查看当天的最近记录": "{0}에 절반 이상이 집중되었습니다. 해당 날짜의 최근 기록 보기",
+  "最近记录中没有这一天的明细。": "최근 기록에 해당 날짜의 내역이 없습니다.",
   "0 分钟": "0분",
   "< 1 分钟": "1분 미만",
   "AI 使用": "AI 사용",

@@ -1,8 +1,9 @@
-import { translateText as tx } from './i18n.js'
+import { serverMessage, translateText as tx } from './i18n.js'
 // Administration API client uses the Vite /api proxy and stores authentication and current-user permissions locally.
 const TOKEN_KEY = 'soduwork_hub_admin_token'
 const USER_KEY = 'soduwork_hub_admin_user'
 let token = localStorage.getItem(TOKEN_KEY) || ''
+let authGeneration = 0
 let me = null
 try { me = JSON.parse(localStorage.getItem(USER_KEY) || 'null') } catch (_e) { me = null }
 const REQUEST_TIMEOUT = 30000
@@ -28,6 +29,31 @@ async function fetchSafe(path, options = {}, timeout = REQUEST_TIMEOUT, consume 
   }
 }
 
+// XMLHttpRequest reports upload bytes; use the same authentication and
+// response handling as fetch once the transfer reaches the server.
+function uploadTransport(onProgress) {
+  return (url, options, timeout) => new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    const abort = () => xhr.abort()
+    xhr.open('POST', url)
+    xhr.timeout = timeout
+    for (const [name, value] of Object.entries(options.headers)) xhr.setRequestHeader(name, value)
+    xhr.upload.onprogress = event => onProgress(event.loaded, event.lengthComputable ? event.total : 0, false)
+    xhr.upload.onload = event => onProgress(event.loaded, event.total, true)
+    xhr.onload = () => {
+      const res = new Response(xhr.responseText || null, { status: xhr.status })
+      responseData(res).then(data => resolve({ res, data }), reject)
+    }
+    xhr.ontimeout = () => reject(new Error(tx("请求超时，请稍后重试")))
+    xhr.onerror = () => reject(new Error(tx("无法连接 SoduWork 服务，请检查后台地址或网络")))
+    xhr.onabort = () => reject(new DOMException('Aborted', 'AbortError'))
+    xhr.onloadend = () => options.signal?.removeEventListener('abort', abort)
+    if (options.signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return }
+    options.signal?.addEventListener('abort', abort, { once: true })
+    xhr.send(options.body)
+  })
+}
+
 async function responseData(res) {
   const text = await res.text()
   if (!text) return null
@@ -36,19 +62,35 @@ async function responseData(res) {
   }
 }
 
+function validationMessage(item) {
+  const fallback = item?.msg || item?.message || String(item || '')
+  if (item?.type === 'hub.input.due') return serverMessage({ key: 'hub.input.due' }, fallback)
+  const [source, field] = Array.isArray(item?.loc) ? item.loc : []
+  if (source !== 'query' || !['limit', 'offset', 'page', 'pageSize', 'days'].includes(field)) return fallback
+  const lower = item.type === 'greater_than_equal'
+  const bound = lower ? item.ctx?.ge : item.ctx?.le
+  if ((!lower && item.type !== 'less_than_equal') || !Number.isFinite(bound)) return fallback
+  return serverMessage({ key: lower ? 'hub.input.minimum' : 'hub.input.maximum', params: { field, bound } }, fallback)
+}
+
 function responseError(res, data) {
   let detail = data && typeof data === 'object' ? data.detail : ''
-  if (Array.isArray(detail)) detail = detail.map((item) => item && item.msg || String(item || '')).filter(Boolean).join('；')
+  if (Array.isArray(detail)) detail = detail.map(validationMessage).filter(Boolean).join('；')
   else if (detail && typeof detail === 'object') detail = detail.message || ''
   if (typeof detail !== 'string' || /^\s*</.test(detail)) detail = ''
+  const code = res.headers.get('X-Error-Code') || ''
+  if (code) detail = serverMessage({ key: code }, detail)
   const error = new Error(detail || tx("请求失败（HTTP {0}）", [res.status]))
   error.status = res.status
+  error.code = code
   error.requestId = res.headers.get('X-Request-ID') || ''
   return error
 }
 
 export function getToken() { return token }
 export function setToken(t) {
+  // A renewed login is a new context even if its token bytes are unchanged.
+  authGeneration += 1
   token = t || ''
   if (t) localStorage.setItem(TOKEN_KEY, t)
   else localStorage.removeItem(TOKEN_KEY)
@@ -62,16 +104,28 @@ export function setUser(u) {
 // Superadministrators bypass permission-point checks; other users require explicit permissions.
 export function can(key) { return !!(me && (me.isSuper || (me.permissions || []).includes(key))) }
 
-async function call(method, path, body, timeout = REQUEST_TIMEOUT) {
-  const headers = { 'Content-Type': 'application/json' }
+function authenticationChanged() {
+  const error = new Error(tx("登录状态已变更，请重试本次操作"))
+  error.code = 'AUTH_CONTEXT_CHANGED'
+  return error
+}
+
+async function authenticatedData(path, options, timeout = REQUEST_TIMEOUT, consume = responseData, transport = fetchSafe) {
+  const generation = authGeneration
+  const headers = { ...options.headers }
   if (token) headers['Authorization'] = 'Bearer ' + token
-  const { res, data } = await fetchSafe('/api/v1' + path, {
-    method,
-    headers,
-    body: body != null ? JSON.stringify(body) : undefined,
-  }, timeout)
+  let response
+  try {
+    response = await transport('/api/v1' + path, { ...options, headers }, timeout, consume)
+  } catch (error) {
+    if (generation !== authGeneration) throw authenticationChanged()
+    throw error
+  }
+  // Old successes and errors must not update a different account's view.
+  if (generation !== authGeneration) throw authenticationChanged()
+  const { res, data } = response
   if (res.status === 401) {
-    setToken(''); setUser('')
+    setToken(''); setUser(null)
     window.dispatchEvent(new Event('soduwork-hub-unauth'))
     throw new Error(tx("登录已失效，请重新登录"))
   }
@@ -79,40 +133,23 @@ async function call(method, path, body, timeout = REQUEST_TIMEOUT) {
   return data
 }
 
+async function call(method, path, body, timeout = REQUEST_TIMEOUT) {
+  return authenticatedData(path, { method, headers: { 'Content-Type': 'application/json' },
+    body: body != null ? JSON.stringify(body) : undefined }, timeout)
+}
+
 async function upload(path, file) {
   const fd = new FormData(); fd.append('file', file)
-  const headers = {}; if (token) headers.Authorization = 'Bearer ' + token
-  const { res, data } = await fetchSafe('/api/v1' + path, { method: 'POST', headers, body: fd }, 90000)
-  if (res.status === 401) {
-    setToken(''); setUser(''); window.dispatchEvent(new Event('soduwork-hub-unauth'))
-    throw new Error(tx("登录已失效，请重新登录"))
-  }
-  if (!res.ok) throw responseError(res, data)
-  return data
+  return authenticatedData(path, { method: 'POST', body: fd }, 90000)
 }
 
 
 async function uploadForm(path, form, timeout = 120000) {
-  const headers = {}; if (token) headers.Authorization = 'Bearer ' + token
-  const { res, data } = await fetchSafe('/api/v1' + path, {
-    method: 'POST', headers, body: form,
-  }, timeout)
-  if (res.status === 401) {
-    setToken(''); setUser(''); window.dispatchEvent(new Event('soduwork-hub-unauth'))
-    throw new Error(tx("登录已失效，请重新登录"))
-  }
-  if (!res.ok) throw responseError(res, data)
-  return data
+  return authenticatedData(path, { method: 'POST', body: form }, timeout)
 }
 async function download(path, filename, timeout = 120000) {
-  const headers = {}; if (token) headers.Authorization = 'Bearer ' + token
-  const { res, data } = await fetchSafe('/api/v1' + path, { headers }, timeout,
+  const data = await authenticatedData(path, {}, timeout,
     response => response.ok ? response.blob() : responseData(response))
-  if (res.status === 401) {
-    setToken(''); setUser(''); window.dispatchEvent(new Event('soduwork-hub-unauth'))
-    throw new Error(tx("登录已失效，请重新登录"))
-  }
-  if (!res.ok) throw responseError(res, data)
   const url = URL.createObjectURL(data)
   const link = document.createElement('a')
   link.href = url; link.download = filename; document.body.appendChild(link); link.click(); link.remove()
@@ -221,7 +258,8 @@ export const api = {
   repositoryCatalog: (integrationId = '', search = '') => call('GET', '/admin/repository-catalog?' + new URLSearchParams({
     ...(integrationId ? { integrationId } : {}), ...(search ? { search } : {}),
   })),
-  syncRepositoryCatalog: (integrationId, clientId = '') => call('POST', '/admin/integrations/' + integrationId + '/repositories/sync', clientId ? { clientId } : {}, REPOSITORY_TIMEOUT),
+  syncRepositoryCatalog: (integrationId, clientId = '') => call('POST', '/admin/integrations/' + encodeURIComponent(integrationId) + '/repositories/sync', clientId ? { clientId } : {}, REPOSITORY_TIMEOUT),
+  repositorySyncProgress: (integrationId) => call('GET', '/admin/integrations/' + encodeURIComponent(integrationId) + '/repositories/sync'),
   savePullAccount: (integrationId, b) => call('POST', '/admin/integrations/' + integrationId + '/pull-account', b),
   testPullAccount: (integrationId, b = {}) => call('POST', '/admin/integrations/' + integrationId + '/pull-account/test', b, REPOSITORY_TIMEOUT),
   repositoryIssueSync: (catalogId) => call('GET', '/admin/repository-catalog/' + encodeURIComponent(catalogId) + '/issue-sync'),
@@ -249,11 +287,12 @@ export const api = {
   },
   setClientReleaseEnabled: (id, enabled) => call(
     'PATCH', '/admin/client-releases/' + encodeURIComponent(id), { enabled }),
-  uploadClientRelease: (bundleFile, installerFile) => {
+  uploadClientRelease: (bundleFile, installerFile, { onProgress, signal } = {}) => {
     const form = new FormData()
     form.append('bundle', bundleFile)
     form.append('installer', installerFile)
-    return uploadForm('/admin/client-releases/upload', form, 900000)
+    return authenticatedData('/admin/client-releases/upload', { method: 'POST', body: form, signal }, 900000, responseData,
+      onProgress ? uploadTransport(onProgress) : fetchSafe)
   },
   assignClient: (id, userId) => call('POST', '/admin/clients/' + id + '/assign', { userId }),
   revokeClient: (id) => call('POST', '/admin/clients/' + id + '/revoke', {}),
@@ -403,7 +442,7 @@ export const api = {
   devFlow: () => call('GET', '/admin/dev-flow'),
   previewDevFlow: (b) => call('POST', '/admin/dev-flow/preview', b),
   automationTemplates: () => call('GET', '/admin/automation-templates'),
-  saveAutomationTemplates: (items) => call('PUT', '/admin/automation-templates', { items }),
+  saveAutomationTemplates: (items, revision) => call('PUT', '/admin/automation-templates', { items, revision }),
   // Integrations and bindings.
   integrations: () => call('GET', '/admin/integrations'),
   createIntegration: (b) => call('POST', '/admin/integrations', b),

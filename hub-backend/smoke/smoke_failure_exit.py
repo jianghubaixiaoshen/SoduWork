@@ -174,14 +174,14 @@ async def main():
         run7.state, cur7.state, cur7.error = "running", "running", ""
         await s.commit()
         node7 = await workflow_runs.redispatch_running_gate(
-            s, run7, actor="张三", execution={"agentKind": "local:claude"})
+            s, run7, actor="张三", execution={"agentKind": "local:qwen"})
         chk("★运行中的 AI 关能重新派", node7 is not None and node7.state == "queued"
             and node7.attempt == 2, node7 and node7.state)
         chk("原尝试被判死且注明人工重派", cur7.state == "failed"
             and (cur7.output or {}).get("failureKind") == "manual_redispatch", cur7.output)
         chk("换的底座写进了 executionOverrides",
             ((run7.context or {}).get("executionOverrides") or {}).get("implement", {})
-            .get("agentKind") == "local:claude", run7.context)
+            .get("agentKind") == "local:qwen", run7.context)
         chk("run 回到运行中", run7.state == "running", run7.state)
         ev7 = (await s.execute(select(models.TaskEvent).where(
             models.TaskEvent.task_id == "t-fail",

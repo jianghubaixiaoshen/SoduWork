@@ -236,6 +236,65 @@ class TransitionTests(unittest.TestCase):
         self.assertEqual((self.ws / "effects.txt").read_text(), "once\n")
         self.assertEqual(len(self.prompts()), 2)
 
+    def test_dsh_permission_change_requires_old_host_exit_before_resume(self):
+        from app.services import local_ctx
+
+        policy = access_policy.normalize({"schema": access_policy.SCHEMA, "revision": 1,
+            "mode": "standard", "workspaceRoot": str(self.ws)})
+        ref = "dsh-permission-exit-boundary"
+        run = {"cli": "dsh", "state": "running", "ws": str(self.ws), "cliSid": "native-kept",
+               "pid": 123, "accessPolicy": policy,
+               "appliedAccessPolicy": {"state": "applied", "policyHash": policy["policyHash"]}}
+        local_base._RUNS[ref] = run
+        self.refs.append(ref)
+        events = []
+
+        def ready(_ref):
+            self.assertEqual(_ref, ref)
+            change = run["_accessTransition"]
+            self.assertFalse(change["allowInProcess"])
+            hot = access_transition.control(ref, policy,
+                {"id": change["id"], "stage": "in-process-ready", "sessionId": "native-kept"})
+            self.assertFalse(hot["requested"])
+            reply = access_transition.control(ref, policy,
+                {"id": change["id"], "stage": "ready", "sessionId": "native-kept"})
+            self.assertTrue(reply["requested"])
+            self.assertFalse(reply["inProcess"])
+            events.append("native-ready")
+
+        def old_host_exit(_delay):
+            # A cancelled prompt may leave native children alive. Readiness
+            # alone must not change their permissions or launch continuation.
+            self.assertEqual(events, ["native-ready"])
+            self.assertEqual(run["accessPolicy"], policy)
+            self.assertEqual(run["state"], "running")
+            self.assertFalse(run["_accessTransition"].get("oldExited"))
+            self.assertTrue(access_transition.finish(ref, 73, ""))
+            events.append("old-host-exited")
+
+        def resume(_ref, prompt, config, *, recovery):
+            self.assertEqual(events, ["native-ready", "old-host-exited"])
+            self.assertTrue(run["_accessTransition"]["oldExited"])
+            self.assertEqual(run["pid"], 0)
+            self.assertIsNone(run["proc"])
+            self.assertEqual((_ref, prompt, recovery), (ref, access_transition.CONTINUATION, True))
+            target = config["accessPolicy"]
+            run.update(state="running", accessPolicy=target,
+                appliedAccessPolicy={"state": "applied", "policyHash": target["policyHash"]})
+            events.append("resumed")
+            return {"ok": True}
+
+        clock = SimpleNamespace(monotonic=time.monotonic, sleep=old_host_exit)
+        with patch.object(access_broker, "wake", side_effect=ready), \
+                patch.object(access_transition, "time", clock), \
+                patch.object(access_transition, "_save_meta"), \
+                patch.object(local_ctx, "prepare_resume", side_effect=resume):
+            changed = self.change(ref, policy)
+        self.assertTrue(changed["ok"], changed)
+        self.assertEqual(events, ["native-ready", "old-host-exited", "resumed"])
+        self.assertEqual(run["accessPolicy"]["mode"], "full")
+        run["state"] = "completed"
+
     def test_standard_full_hot_transition_keeps_process_and_avoids_cold_initialization(self):
         for agent in ("qwen", "codex-harness"):
             with self.subTest(agent=agent):

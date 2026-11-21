@@ -88,11 +88,24 @@ function UserEditor({ user, orgs, roles, onClose, onDone }) {
   const [posCat, setPosCat] = useState([])
   const [domSel, setDomSel] = useState(user ? (user.domains || []) : [])
   const [domCat, setDomCat] = useState([])
+  const [domStatus, setDomStatus] = useState('loading')
   const [mgrOpen, setMgrOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const opts = orgOptions(orgs)
   const nm = displayName || username || '?'
-  const loadDomains = () => api.domains().then((d) => setDomCat(d || [])).catch(() => setDomCat([]))
+  const loadDomains = () => {
+    setDomStatus('loading')
+    return api.domains().then((d) => {
+      if (!Array.isArray(d) || d.some((entry) => !entry || typeof entry.id !== 'string' || !entry.id)) {
+        setDomStatus('error'); return
+      }
+      setDomCat(d); setDomStatus('ready')
+    })
+      .catch(() => setDomStatus('error'))
+  }
+  // A failed catalog read does not prove that any saved assignment was deleted.
+  const unavailableDomains = domStatus === 'ready'
+    ? [...new Set(domSel)].filter((id) => !domCat.some((d) => d.id === id)) : []
   useEffect(() => {
     api.positions().then((p) => setPosCat(p || [])).catch(() => setPosCat([]))
     loadDomains()
@@ -132,10 +145,10 @@ function UserEditor({ user, orgs, roles, onClose, onDone }) {
         </div>
       </div>
       <div style={{ display: 'flex', gap: 12 }}>
-        <div style={{ flex: 1 }}><label className="f-lbl" htmlFor={`${formId}-username`}>{tx("账号")}</label><input id={`${formId}-username`} className="f-in" value={username} disabled={!isNew} required={isNew} onChange={(e) => setUsername(e.target.value)} placeholder={tx("登录账号")} /></div>
-        <div style={{ flex: 1 }}><label className="f-lbl" htmlFor={`${formId}-name`}>{tx("姓名")}</label><input id={`${formId}-name`} className="f-in" value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder={tx("显示名")} /></div>
+        <div style={{ flex: 1 }}><label className="f-lbl" htmlFor={`${formId}-username`}>{tx("账号")}</label><input id={`${formId}-username`} name="managed-username" autoComplete="off" className="f-in" value={username} disabled={!isNew} required={isNew} onChange={(e) => setUsername(e.target.value)} placeholder={tx("登录账号")} /></div>
+        <div style={{ flex: 1 }}><label className="f-lbl" htmlFor={`${formId}-name`}>{tx("姓名")}</label><input id={`${formId}-name`} name="managed-display-name" autoComplete="off" className="f-in" value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder={tx("显示名")} /></div>
       </div>
-      <div><label className="f-lbl" htmlFor={`${formId}-password`}>{isNew ? tx("初始密码") : tx("重置密码（留空不改）")}</label><input id={`${formId}-password`} className="f-in" type="password" value={password} required={isNew} onChange={(e) => setPassword(e.target.value)} placeholder={isNew ? tx("设置初始密码") : tx("不改则留空")} /></div>
+      <div><label className="f-lbl" htmlFor={`${formId}-password`}>{isNew ? tx("初始密码") : tx("重置密码（留空不改）")}</label><input id={`${formId}-password`} name="managed-new-password" autoComplete="new-password" className="f-in" type="password" value={password} required={isNew} onChange={(e) => setPassword(e.target.value)} placeholder={isNew ? tx("设置初始密码") : tx("不改则留空")} /></div>
       <div style={{ display: 'flex', gap: 12 }}>
         <div style={{ flex: 1 }}><label className="f-lbl" id={`${formId}-org-label`} htmlFor={`${formId}-org`}>{tx("所属部门")}</label>
           <SelectMenu searchable id={`${formId}-org`} aria-labelledby={`${formId}-org-label`} required className="f-in" value={orgId} onChange={(e) => setOrgId(e.target.value)}><option value="">{tx("— 选择部门 —")}</option>{opts.map((o) => <option key={o.id} value={o.id} data-path={o.path}>{o.label}</option>)}</SelectMenu>
@@ -154,10 +167,16 @@ function UserEditor({ user, orgs, roles, onClose, onDone }) {
       </div>
       <div><div className="f-lbl" style={{ display: 'flex', alignItems: 'center', gap: 8 }}><span id={`${formId}-domains-label`}>{tx("负责领域 / 模块（可多选，分配需求时优先选择对应负责人）")}</span><button type="button" className="linkbtn" style={{ marginLeft: 'auto' }} onClick={() => setMgrOpen(true)}>{tx("管理领域")}</button>
         </div>
+        {domStatus === 'error' && <div className="muted" role="status">{tx("领域列表加载失败，请重试。")} <button type="button" className="linkbtn" onClick={loadDomains}>{tx("重试")}</button></div>}
+        {unavailableDomains.length > 0 && <div className="muted" role="status">{tx("部分已选领域已不存在，请点击对应项移除后再保存。")}</div>}
         <div className="posgrid" role="group" aria-labelledby={`${formId}-domains-label`}>
-          {domCat.length === 0 && <span className="muted" style={{ fontSize: 14.5 }}>{tx("暂无领域，点「管理领域」新建")}</span>}
+          {domStatus === 'loading' && <span className="muted">{tx("加载中…")}</span>}
+          {domStatus === 'ready' && domCat.length === 0 && <span className="muted" style={{ fontSize: 14.5 }}>{tx("暂无领域，点「管理领域」新建")}</span>}
           {domCat.map((d) => (
             <button type="button" key={d.id} className={'poschip' + (domSel.includes(d.id) ? ' on' : '')} aria-pressed={domSel.includes(d.id)} onClick={() => toggleDom(d.id)}>{tx(d.name)}</button>
+          ))}
+          {unavailableDomains.map((id) => (
+            <button type="button" key={id} className="poschip on" aria-pressed={true} onClick={() => toggleDom(id)}>{tx("已不存在的领域：{0}", [id])}</button>
           ))}
         </div>
       </div>

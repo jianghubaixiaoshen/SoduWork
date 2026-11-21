@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import automation_models as am
 from .. import models
-from . import approval_routing, task_events
+from . import approval_policies, approval_routing, task_events
 
 ENV_TEST = "env-system-test"
 ENV_PRODUCTION = "env-system-production"
@@ -463,10 +463,18 @@ async def ensure_request(session: AsyncSession, task: models.Task, artifact: am.
            "deploy": POLICY_PRODUCTION}.get(action, POLICY_REVIEW)
     if action in ("deploy", "uat") and environment_id:
         env = await session.get(am.Environment, environment_id)
-        pid = str((context or {}).get("approvalPolicyId") or
-                  ((env.approval_policy_id if action == "deploy" else
-                    env.acceptance_policy_id) if env else "") or pid)
-    policy = await session.get(am.ApprovalPolicy, pid)
+        configured_id = (context or {}).get("approvalPolicyId")
+        if not configured_id and env is not None:
+            configured_id = env.approval_policy_id if action == "deploy" else env.acceptance_policy_id
+        pid = str(configured_id or pid)
+        # Older environments can still contain an out-of-scope reference.
+        policy = await approval_policies.for_environment(session, pid, env.org_id if env else None)
+        if configured_id and policy is None:
+            raise ValueError("审批职责不存在或不属于这个环境的组织")
+    else:
+        policy = await session.get(am.ApprovalPolicy, pid)
+    if policy and not policy.enabled:
+        raise ValueError("该审批策略已停用，无需审批")
     rules = dict((policy.rules if policy else {}) or {})
     # Freeze version, criteria and evidence refs when a gate is created.
     from . import gate_contract
@@ -528,9 +536,10 @@ async def can_decide(session: AsyncSession, task: models.Task, request: am.Appro
 
 async def decide(session: AsyncSession, task: models.Task, actor, *, action: str,
                  decision: str, note: str = "", artifact_version_id: str = "",
-                 environment_id: str = "") -> dict:
+                 environment_id: str = "", commit: bool = True) -> dict:
     """Decide on the current version. Rejection takes effect immediately; approval requires the
-    configured countersignature count.
+    configured countersignature count. The approval inbox defers the deploy vote's commit
+    so the final vote and its deployment runs are written in one transaction.
     """
     decision = str(decision or "").lower()
     if decision not in ("approve", "reject"):
@@ -596,7 +605,7 @@ async def decide(session: AsyncSession, task: models.Task, actor, *, action: str
     if decision == "reject":
         req.status = "rejected"
         req.resolved_at = _now()
-        if action in ("baseline", "review", "uat"):
+        if action in ("baseline", "review"):
             artifact.state = "rejected"
         task_events.record(session, task.id, "release.rejected",
                            {"requestId": req.id, "versionId": artifact.id,
@@ -635,7 +644,10 @@ async def decide(session: AsyncSession, task: models.Task, actor, *, action: str
             task_events.record(session, task.id, "release.approved",
                                {"requestId": req.id, "versionId": artifact.id,
                                 "action": action, "note": d.note}, actor=d.user_name)
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     delivery = None
     if continue_existing_merge:
         from . import code_delivery

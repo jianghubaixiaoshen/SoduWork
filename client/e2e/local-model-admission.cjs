@@ -9,16 +9,19 @@ if (typeof electron === 'string') {
     'CHROME_CRASHPAD_PIPE_HANDLE', 'ELECTRON_NO_ATTACH_CONSOLE']) delete env[key];
   const args = [__filename, '--no-sandbox', '--disable-gpu'];
   if (process.platform === 'linux' && !env.DISPLAY) args.push('--ozone-platform=headless');
-  const result = require('node:child_process').spawnSync(electron, args, { env, stdio: 'inherit', timeout: 180000 });
-  process.exit(result.status ?? 1);
+  const status = require('./lib/isolated-profile.cjs').withTemporaryRoot('soduwork-local-admission-e2e-', root => {
+    env.SODUWORK_ADMISSION_TEST_ROOT = root;
+    return require('node:child_process').spawnSync(electron, args, { env, stdio: 'inherit', timeout: 180000 }).status;
+  });
+  process.exit(status ?? 1);
 }
 
 const { app, BrowserWindow, ipcMain, safeStorage, net } = electron;
-const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
+const fs = require('node:fs'), path = require('node:path');
 const http = require('node:http'), crypto = require('node:crypto'), assert = require('node:assert/strict');
 const { pathToFileURL } = require('node:url');
 const client = path.resolve(__dirname, '..');
-const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'soduwork-local-admission-e2e-')));
+const root = process.env.SODUWORK_ADMISSION_TEST_ROOT;
 const profile = path.join(root, 'profile'), cwd = path.join(root, 'workspace');
 fs.mkdirSync(profile); fs.mkdirSync(cwd);
 app.setAppPath(client); app.setPath('userData', profile); app.disableHardwareAcceleration();
@@ -255,6 +258,5 @@ app.whenReady().then(async () => {
     const closed = new Promise(resolve => server.close(resolve)); server.closeAllConnections(); await closed;
   }
   console.log(JSON.stringify(report, null, 2));
-  fs.rmSync(root, { recursive: true, force: true });
   app.exit(report.ok ? 0 : 1);
 });

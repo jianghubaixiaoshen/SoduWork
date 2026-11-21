@@ -96,17 +96,15 @@ class PersonalModelQuotaTests(unittest.IsolatedAsyncioTestCase):
                 json={"model": "shared-model", "messages": [], "quotaUsageToken": private.json()["quotaUsageToken"]})
             self.assertEqual(result.status_code, 409, result.text)
             upstream.assert_not_awaited()
-        # Own keys on an organization provider also count as personally funded.
+        # A personal key cannot reclassify a managed provider's platform funding.
         saved = await self.http.put("/api/v1/my-models", headers=self.headers,
             json={"keys": {"shared": secrets.token_urlsafe(24)}})
-        self.assertEqual(saved.status_code, 200, saved.text)
-        own = await self.config("shared-model")
-        self.assertEqual(own.status_code, 200, own.text)
-        self.assertEqual(own.json()["keyFrom"], "mine")
-        self.assertEqual(own.json()["quotaScope"], "personal")
+        self.assertEqual(saved.status_code, 403, saved.text)
+        self.assertEqual((await self.config("shared-model")).status_code, 403)
 
     async def test_runtime_bound_receipts_apply_only_to_the_authorized_executor(self):
-        for index, agent in enumerate(("qwen", "opencode", "codex-harness", "dsh", "kimi", "harness2", "custom-acp")):
+        agents = ("qwen", "opencode", "codex-harness", "dsh", "kimi", "custom-acp")
+        for index, agent in enumerate(agents):
             with self.subTest(agent=agent):
                 configured = await self.config(agent=agent)
                 self.assertEqual(configured.status_code, 200, configured.text)
@@ -126,8 +124,8 @@ class PersonalModelQuotaTests(unittest.IsolatedAsyncioTestCase):
             provider="custom-local", model="local-model", agent="custom-device-example")
         self.assertEqual(reported.status_code, 200, reported.text)
         async with self.sessions() as session:
-            self.assertEqual(await client_access.monthly_tokens(session, self.user.id), 7)
-        for agent in ("codex", "claude"):
+            self.assertEqual(await client_access.monthly_tokens(session, self.user.id), len(agents))
+        for agent in ("codex",):
             configured = await self.config(agent=agent)
             self.assertFalse(configured.json()["ok"])
             self.assertNotIn("quotaUsageToken", configured.json())
@@ -237,12 +235,10 @@ class PersonalModelQuotaTests(unittest.IsolatedAsyncioTestCase):
                              (42, "shared", "platform"))
 
     async def test_personal_credentials_revoked_during_capacity_wait_never_call_upstream(self):
-        saved = await self.http.put("/api/v1/my-models", headers=self.headers,
-            json={"keys": {"shared": secrets.token_urlsafe(24)}})
-        self.assertEqual(saved.status_code, 200)
+        await self.keyed_personal_model()
         async with self.sessions() as session:
             client = await session.get(models.Client, self.devices[0].id)
-            conf = await model_catalog.resolve(session, client, "shared-model")
+            conf = await model_catalog.resolve(session, client, "keyed-model")
             conf["quotaScope"] = "personal"
         lease = SimpleNamespace(close=AsyncMock())
         async def acquired(_conf):
@@ -260,24 +256,34 @@ class PersonalModelQuotaTests(unittest.IsolatedAsyncioTestCase):
             upstream.assert_not_called()
             lease.close.assert_awaited_once()
 
-    async def test_proxy_ticket_rejects_funding_changes_while_platform_budget_remains(self):
-        platform = (await self.config("shared-model")).json()
+    async def keyed_personal_model(self):
+        before = await self.http.get("/api/v1/my-models", headers=self.headers)
+        saved = await self.http.put("/api/v1/my-models", headers=self.headers, json={
+            "expectedRevision": before.json()["revision"],
+            "providers": [{"id": "custom-keyed", "name": "Personal", "baseUrl": "http://127.0.0.1:1/v1"}],
+            "models": [{"providerId": "custom-keyed", "name": "keyed-model"}],
+            "keys": {"custom-keyed": secrets.token_urlsafe(24)}})
+        self.assertEqual(saved.status_code, 200, saved.text)
+
+    async def test_proxy_ticket_rejects_personal_key_changes_while_platform_budget_remains(self):
+        await self.keyed_personal_model()
+        original = (await self.config("keyed-model")).json()
         await self.http.put("/api/v1/my-models", headers=self.headers,
-            json={"keys": {"shared": secrets.token_urlsafe(24)}})
-        personal = (await self.config("shared-model")).json()
+            json={"keys": {"custom-keyed": secrets.token_urlsafe(24)}})
+        personal = (await self.config("keyed-model")).json()
         with patch.object(model_transport, "open_response", new=AsyncMock()) as upstream:
             response = await self.http.post("/api/v1/ai-proxy/v1/chat/completions",
-                headers={"Authorization": "Bearer " + platform["key"]},
-                json={"model": "shared-model", "messages": []})
+                headers={"Authorization": "Bearer " + original["key"]},
+                json={"model": "keyed-model", "messages": []})
             self.assertEqual(response.status_code, 409, response.text)
-            await self.http.put("/api/v1/my-models", headers=self.headers, json={"keys": {"shared": None}})
+            await self.http.put("/api/v1/my-models", headers=self.headers, json={"keys": {"custom-keyed": None}})
             response = await self.http.post("/api/v1/ai-proxy/v1/chat/completions",
                 headers={"Authorization": "Bearer " + personal["key"]},
-                json={"model": "shared-model", "messages": []})
-            self.assertEqual(response.status_code, 409, response.text)
+                json={"model": "keyed-model", "messages": []})
+            self.assertEqual(response.status_code, 400, response.text)
             upstream.assert_not_awaited()
         # A real earlier personal increment may still settle after the key changes.
-        result = await self.receipt(5, token=personal["quotaUsageToken"])
+        result = await self.receipt(5, token=personal["quotaUsageToken"], provider="custom-keyed", model="keyed-model")
         self.assertEqual(result.status_code, 200)
         async with self.sessions() as session:
             self.assertEqual(await client_access.monthly_tokens(session, self.user.id), 0)

@@ -75,6 +75,23 @@ function fixture({ fresh = false, attachments, send, files: initialFiles } = {})
   return { ctx, input, bridge, requests, notices, added, plugins, switchTo, paints: () => paints };
 }
 
+test('automation timing uses the send click before asynchronous access checks', async () => {
+  const f = fixture(), check = deferred(); let clock = Date.parse('2099-11-16T12:13:00Z'), routed;
+  f.ctx.Date = class extends Date { static now() { return clock; } };
+  f.ctx._composerControls = {waitForAccess: () => check.promise};
+  f.ctx.global.ChatWorkActions = f.ctx.ChatWorkActions = {route: async options => {
+    routed = options; return {handled:true,accepted:true};
+  }};
+  vm.runInContext(require('./renderer-source.cjs').factoryFunction('chat-session-controller.js','ChatSessionController','_send'), f.ctx);
+  f.input.value = '修改为10分钟之后';
+  const sentAt = clock, pending = f.ctx._send(); await flush();
+  clock += 120000; check.resolve(true);
+  assert.equal(await pending, true);
+  assert.equal(routed.requestedAt, sentAt);
+  assert.equal(routed.text, '修改为10分钟之后');
+  assert.equal(f.requests.length, 0);
+});
+
 test('model preflight shows pending state, preserves an acceptance draft on failure, and allows retry', async () => {
   const f = fixture(), check = deferred(), states = [];
   let token = 0, cleared = 0;
@@ -102,6 +119,18 @@ test('model preflight shows pending state, preserves an acceptance draft on fail
   assert.equal(f.requests[0][3].taskExecution.acceptanceMode, 'auto');
   assert.equal(f.requests[0][3].taskExecution.approvalId, 'review-1');
   assert.equal(states.at(-1), 'idle');
+});
+
+test('review sends preserve the exact generated template and distinct reviewer instruction without promoting history to a fresh instruction',async()=>{
+  const f=fixture(),draft='【验收分析】\nOriginal and historical supplement context';
+  f.ctx._sessionOptions={acceptanceExecutionSession:true,acceptanceMode:'manual',approvalId:'review-1',
+    acceptanceDraft:draft,acceptanceInstruction:'Fresh reviewer note'};
+  f.ctx._activeCollabTaskId='review-task';f.ctx._collabTasks=new Map([['review-task',{task:{id:'review-task',status:'reviewing'},nativeTurn:true}]]);
+  f.input.value=draft+'\n\nFresh composer addition';
+  assert.equal(await f.ctx._sendCore(),true);
+  const sent=f.requests[0][3].taskExecution;
+  assert.equal(sent.acceptanceOnly,true);assert.equal(sent.acceptanceDraft,draft);assert.equal(sent.acceptanceInstruction,'Fresh reviewer note');
+  assert.equal(f.requests[0][1],draft+'\n\nFresh composer addition');
 });
 
 test('a late preflight error cannot overwrite a different conversation or account', async () => {

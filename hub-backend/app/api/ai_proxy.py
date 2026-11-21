@@ -104,7 +104,7 @@ def _upstream_message(status: int, detail: str, *, responses: bool = False) -> s
         return "模型服务当前繁忙或额度受限，请稍后重试"
     hint = {
         401: "密钥不对或已过期",
-        403: "这把密钥没有这个模型的权限",
+        403: "模型请求被拒绝",
         404: "网关地址、模型名或接口不对" if responses else "网关地址或模型名不对",
         405: "当前模型网关尚未开放 Responses 接口",
     }.get(status, "")
@@ -121,6 +121,15 @@ def _err(status: int, msg: str, upstream: str = "") -> JSONResponse:
     if billing:
         body["error"] = {"message": model_errors.billing_message(billing),
                          "type": "soduwork_proxy_error", "status": status, **billing}
+    elif status in (400, 422) and model_errors.output_limit_exceeded(diagnostic):
+        # SDKs may retain only message, so keep the safe classification there too.
+        body["error"] = {"message": "Output token limit exceeded (output_token_limit_exceeded).",
+                         "type": "soduwork_proxy_error", "status": status,
+                         "code": "output_token_limit_exceeded"}
+    elif status in (400, 422) and model_errors.thinking_disabled_unsupported(diagnostic):
+        body["error"] = {"message": model_errors.THINKING_DISABLED_MESSAGE,
+                         "type": "soduwork_proxy_error", "status": status,
+                         "code": "thinking_disabled_unsupported"}
     elif status in (400, 413, 422) and local_context_policy.OVERFLOW.search(diagnostic):
         window = local_context_policy.error_window(diagnostic)
         message = "Context length exceeded."
@@ -417,14 +426,21 @@ def _proxy_error(exc, *, responses=False):
                   _error_message(exc, responses=responses), exc.body)
     delay = getattr(exc, "retry_after", 0)
     payload = json.loads(result.body)
+    trace = str(getattr(exc, "diagnostic_id", ""))
+    headers = {}
+    if re.fullmatch(r"[a-f0-9]{32}", trace):
+        payload["error"]["diagnosticId"] = trace
+        payload["error"]["message"] += f" [soduwork-trace:{trace}]"
+        request_id = getattr(exc, "upstream_request_id", "")
+        if request_id:
+            payload["error"]["upstreamRequestId"] = request_id
     if (payload.get("error", {}).get("code") != "upstream_billing_error"
             and isinstance(delay, (int, float)) and 0 < delay <= 86400):
         payload["error"]["retry_after_ms"] = int(delay * 1000)
         # Preserve the hint for SDKs that retain only error.message.
         payload["error"]["message"] += f" Retry after {delay:g} seconds."
-        result = JSONResponse(status_code=result.status_code, content=payload,
-                              headers={"Retry-After": str(delay)})
-    return result
+        headers["Retry-After"] = str(delay)
+    return JSONResponse(status_code=result.status_code, content=payload, headers=headers)
 
 
 async def _release_catalog_connection(session):
@@ -570,6 +586,7 @@ async def proxy_config(
             "maxOutputTokens": conf.get("maxOutputTokens") or model_capabilities.DEFAULT_OUTPUT,
             "configRevision": conf.get("configRevision") or "",
             "runtimeRevision": conf.get("runtimeRevision") or "",
+            "compatibility": model_capabilities.compatibility(conf.get("compatibility")),
             "label": hit.get("label") or conf["model"],
             "providerName": hit.get("providerName") or conf.get("provider") or "",
             "keyFrom": conf.get("keyFrom") or "",

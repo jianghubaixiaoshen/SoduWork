@@ -37,8 +37,11 @@ async send(text, turnAttachments, sendOptions) {
       // cannot alter the active turn or capture an outdated selection.
       const requestedPluginIds = _pluginIds(Array.isArray(turn.pluginIds)
         ? turn.pluginIds : (turn.plugins || []).map((item) => item && item.pluginId));
+      // The host marks its accepted snapshot of an implicit selection. Renderer
+      // options cannot supply this marker through the normalized IPC boundary.
+      const inheritedPlugins = !requestedPluginIds.length || turn.inheritedPluginSelection === true;
       if (turn.clearPluginSelection === true) ctx.persistPluginSelection([]);
-      const effectivePluginIds = turn.clearPluginSelection !== true && requestedPluginIds.length
+      let effectivePluginIds = turn.clearPluginSelection !== true && requestedPluginIds.length
         ? requestedPluginIds.slice() : ctx.activePluginIds.slice();
       const accessReady = await ctx.liveAccess.wait();
       ctx.skillSelectionFailure = null;
@@ -47,6 +50,20 @@ async send(text, turnAttachments, sendOptions) {
       if (!turn.internal) {
         try { await ctx.accessChanges.apply(); }
         catch (error) { return { ok: false, retrySafe: true, reason: '权限变更未生效：' + String(error?.message || error) }; }
+      }
+      if (interrupted() || ctx.closed) return { ok: true, cancelled: true, manualStop: true };
+      if (inheritedPlugins && turn.clearPluginSelection !== true &&
+          !turn.internal && !turn.controlled && !turn.taskId && !ctx.handle.taskRef && !ctx.handle.taskIds?.length &&
+          !turn.goalMode && !ctx.goalEnabled && !ctx.goalVisible && ctx.opts.intent !== 'goal' &&
+          turn.source !== 'automation' && !ctx.handle.appPluginId && !ctx.opts.appContext) {
+        try {
+          const retained = require('../personal-plugins').pruneUnavailableInherited(ctx.opts.app, effectivePluginIds);
+          if (retained.length !== effectivePluginIds.length) ctx.persistPluginSelection(retained);
+          effectivePluginIds = retained;
+        } catch (error) {
+          return { ok: false, failureKind: 'plugin-grant', retrySafe: true,
+            reason: '插件没能在发送前完成授权：' + String(error?.message || error) };
+        }
       }
       const imageChoice = turn.modelName === undefined ? ctx.modelSelection.capture() : turn.modelName;
       if (require('./image-model').imageChoice(imageChoice)) {
@@ -137,7 +154,7 @@ async send(text, turnAttachments, sendOptions) {
         return { ok: true, cancelled: true, manualStop: true };
       }
       // A rejected preflight must not make later plain messages inherit an unusable plugin.
-      if (turn.clearPluginSelection !== true && requestedPluginIds.length) ctx.persistPluginSelection(requestedPluginIds);
+      if (turn.clearPluginSelection !== true && requestedPluginIds.length) ctx.persistPluginSelection(effectivePluginIds);
       const internal = Boolean(turn.internal);
       if (!internal || !ctx.desktopControlScope) {
         ctx.desktopControlScope = 'pi:' + ctx.ref + ':' + require('node:crypto').randomUUID();
@@ -199,7 +216,9 @@ async send(text, turnAttachments, sendOptions) {
             ctx.acc.state.tools.slice(toolFrom), outputSnapshot),
         };
       };
+      let pluginGate = null;
       let restoreSkills = () => {};
+      let restoreTools = () => {};
       let connectors = null;
       let modelRequestError = null;
       try {
@@ -251,6 +270,9 @@ async send(text, turnAttachments, sendOptions) {
         // model captured when the conversation was originally opened.
         // Raw image blocks require a server-declared native route; legacy clients
         // optimistically cached [text, image] for every gateway model.
+        restoreTools = require('./model-tools.cjs').prepare(ctx.piSession, ctx.prep.model,
+          Boolean((ctx.opts.capabilityIds || []).length || effectivePluginIds.length || selectedSkills.skills.length ||
+            runAsGoal && profile.kind !== 'conversation'));
         const nativeImages = Boolean(ctx.prep.model?.imageRouting === 'native' &&
           ctx.prep.model?.input?.includes('image'));
         const observationInputs = imageRouting.observationInputs(ctx.prep.model, visualInputs, ctx.piSession.messages,
@@ -266,6 +288,33 @@ async send(text, turnAttachments, sendOptions) {
         modelPrompt = require('./input-context.cjs').augment(modelPrompt,
           [turn.promptText, materialUnderstanding.eligible ? materialUnderstanding.prompt : ''].filter(Boolean).join('\n\n'));
         await ctx.beginTurnJournal(turn);
+        // Native recovery remains part of the original logical submission.
+        if (!(turn.internal && turn.runtimeRecovery) || !ctx.run.pluginGenerationTurn) ctx.run.pluginGenerationTurn = {};
+        const pluginGenerationTurn = ctx.run.pluginGenerationTurn;
+        const permissionRevision = ctx.accessPolicy?.revision;
+        const repairCancelled = () => interrupted() || ctx.closed || ctx.goalCancelled ||
+          ctx.liveAccess.changing() || Boolean(ctx.accessChanges.pending()) || ctx.accessPolicy?.revision !== permissionRevision;
+        pluginGate = await require('./plugin-generation-gate.cjs').begin({
+          handle: ctx.handle, app: ctx.opts.app, identity: ctx.identity, logicalOwner: pluginGenerationTurn,
+          selectedPluginIds: effectivePluginIds,
+          cancelled: () => repairCancelled() || Boolean(ctx.run.stopReason),
+          pauseConfirmed: () => Boolean(ctx.limitRequest) && !repairCancelled(),
+          changed: () => ctx._emit({ kind: 'plugin-validation' }),
+          repair: async prompt => {
+            await ctx._promptComplete(prompt, { pluginRepair: true });
+            const snapshot = ctx._snapshot();
+            const completion = snapshot.completion || {};
+            const cancelled = repairCancelled();
+            const paused = Boolean(ctx.limitRequest);
+            return { ok: cancelled || paused && completion.reason !== 'error' ||
+                ctx.acc.status() === 'idle' && !ctx.run.stopReason,
+              cancelled, paused, snapshot,
+              ...(completion.reason === 'error' ? {
+                reason: completion.error, retrySafe: completion.retryable === true,
+              } : {}) };
+          },
+        });
+        if (!pluginGate.canStart()) return { ok: true, cancelled: true, manualStop: true };
         let completion;
         try {
           completion = await ctx._promptComplete(modelPrompt, { images: nativeImages ? visualInputs : [] });
@@ -475,8 +524,11 @@ async send(text, turnAttachments, sendOptions) {
           goalMode: runAsGoal, request: rawText,
           pluginIds: effectivePluginIds, projectId: turn.projectId, skills: selectedSkills.names,
         });
-        return (deliveryResult = { ok: true, paused: Boolean(ctx.limitRequest) && !recovering,
+        deliveryResult = await pluginGate.finish({ ok: true, paused: Boolean(ctx.limitRequest) && !recovering,
           recovering, modelRecoveryGoal: runAsGoal, snapshot: ctx._snapshot() });
+        deliveryResult = { ...deliveryResult, snapshot: ctx._snapshot() };
+        if (deliveryResult.ok === false) ctx.failedLastTurn = true;
+        return deliveryResult;
       } catch (e) {
         if (interrupted() || ctx.closed || e?.code === 'EVIDENCE_INTERRUPTED' &&
             ctx.acc.status() === 'aborted' && !ctx.goalCancelled && !ctx.limitRequest)
@@ -549,8 +601,9 @@ async send(text, turnAttachments, sendOptions) {
             ...require('../../core/token-quota').fields(e),
           modelRecoveryGoal: runAsGoal, snapshot: ctx._snapshot() };
       } finally {
+        pluginGate?.dispose();
         runControl.finishTurn(ctx.run);
-        try { restoreSkills(); }
+        try { restoreTools(); restoreSkills(); }
         finally {
           connectors?.cleanup();
           if (pluginGrant && typeof pluginGrant.cleanup === 'function') pluginGrant.cleanup();

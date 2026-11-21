@@ -39,7 +39,7 @@ function fixture(approval = {}, decide = async () => ({ok: true, request: {statu
     decideApproval: (...args) => { calls.push(args); return decide(...args); },
     getAcceptanceContext: async () => ({artifactVersionId:'fixed-v1', criteria:[{id:'c1', label:'Reviewable result'}]}),
   };
-  const context = {window: {petSay: text => notices.push(text), SoduWorkAPI: apiImpl,
+  const context = {document: {activeElement: null}, window: {petSay: text => notices.push(text), SoduWorkAPI: apiImpl,
     addEventListener: (name, handler) => { events[name] = handler; }}};
   vm.runInNewContext(source, context);
   const api = context.window.TaskTraceApproval;
@@ -151,7 +151,90 @@ test('automatic preflight uses frozen approval criteria and allows retry after c
   assert.equal(calls[0][2].acceptanceMode, 'auto');
 });
 
-test('unavailable automatic preflight never navigates and manual review remains usable', async () => {
+function acceptanceCardFixture() {
+  const f = fixture({action: 'review'});
+  f.state.opts = {taskId: 'task-1'};
+  const sessionButton = mode => ({disabled: false, isConnected: true,
+    getAttribute: name => name === 'data-tfd-acceptance-session' ? mode : null,
+    closest: selector => selector === '.tfd-inline-approval' ? f.block :
+      selector === '[data-tfd-acceptance-session]' ? (mode === 'auto' ? auto : manual) : null});
+  const auto = sessionButton('auto'), manual = sessionButton('1');
+  const controls = [f.approve, f.reject, auto, manual];
+  f.block.querySelectorAll = selector => selector.includes('[data-tfd-approval-action]') ? controls : [];
+  f.root.querySelectorAll = () => [f.block];
+  f.block.getAttribute = name => name === 'data-tfd-approval-id' ? 'gate-1' :
+    name === 'data-tfd-consent' ? 'fixed-v1' : null;
+  return {...f, auto, manual};
+}
+
+test('missing automatic prerequisites disable the clicked action through rebind while manual review stays available', async () => {
+  const f = acceptanceCardFixture();
+  let reads = 0, opened = 0;
+  f.window.SoduWorkAPI.getAcceptanceContext = async () => {reads++; return {artifactVersionId:'fixed-v1', criteria:[]};};
+  f.window.openTaskConversation = async () => {opened++; return true;};
+  f.note.value = 'Keep this review note';
+  assert.equal(f.auto.disabled, false);
+  f.click(f.auto); await settle();
+  assert.match(f.error.textContent, /请切换为“手动验收”，核对交付成果后确认/);
+  assert.equal(f.error.hidden, false);
+  assert.equal(f.auto.disabled, true);
+  assert.equal(f.manual.disabled, false);
+  assert.equal(f.approve.disabled, false);
+  assert.equal(f.reject.disabled, false);
+  assert.equal(f.note.value, 'Keep this review note');
+  assert.equal(opened, 0);
+  f.api.bind(f.root, f.state);
+  f.selectMode('manual'); f.selectMode('auto');
+  assert.equal(f.auto.disabled, true);
+  f.window.SoduWorkAPI.approvalDetail = async () => ({item:{...f.item, assignment:{userId:'me', reasons:[]}}});
+  f.api.bind(f.root, f.state); await settle();
+  assert.equal(f.auto.disabled, true);
+  assert.equal(f.error.hidden, false);
+  f.click(f.auto); await settle();
+  assert.equal(reads, 1, 'Repeated clicks cannot rerun the same failed preflight');
+  f.click(f.manual); await settle();
+  assert.equal(opened, 1);
+});
+
+test('automatic review remains retryable after a temporary service or conversation error', async () => {
+  for (const failure of ['service', 'navigation']) {
+    const f = acceptanceCardFixture();
+    f.window.SoduWorkAPI.getAcceptanceContext = async () => {
+      if (failure === 'service') throw Error('Temporary service failure');
+      return {artifactVersionId:'fixed-v1', criteria:[{id:'c1', label:'Reviewable result'}]};
+    };
+    f.window.openTaskConversation = async () => false;
+    f.click(f.auto); await settle();
+    assert.equal(f.error.hidden, false);
+    assert.equal(f.auto.disabled, false, failure);
+  }
+});
+
+test('the automatic-review block follows only the same approval and fixed version through card replacement', async () => {
+  const f = acceptanceCardFixture();
+  f.window.SoduWorkAPI.getAcceptanceContext = async () => ({artifactVersionId:'fixed-v1', criteria:[]});
+  f.window.openTaskConversation = async () => true;
+  f.click(f.auto); await settle();
+  const message = f.error.textContent;
+  const replacement = (id, version) => ({dataset: {}, error: {hidden:true},
+    getAttribute: name => name === 'data-tfd-approval-id' ? id : name === 'data-tfd-consent' ? version : null,
+    querySelector(selector) {return selector === '[data-tfd-approval-error]' ? this.error : null;},
+    querySelectorAll: () => []});
+  for (const [id, version, blocked] of [['gate-1', 'fixed-v1', true], ['gate-1', 'fixed-v2', false], ['gate-2', 'fixed-v1', false]]) {
+    const block = replacement(id, version);
+    const current = {querySelectorAll: () => [f.block], replaceWith() {}};
+    const wanted = {outerHTML: 'changed-' + id + version, querySelectorAll: () => [block]};
+    f.api.patch(current, wanted);
+    assert.equal(Boolean(block.dataset.tfdAutoUnavailable), blocked);
+    if (blocked) {
+      assert.equal(block.dataset.tfdAutoUnavailable, message);
+      assert.equal(block.error.hidden, false);
+      assert.equal(block.error.textContent, message);
+    }
+  }
+});
+
+test('unavailable review context never navigates and a legacy bridge without that method still permits explicit manual review', async () => {
   for (const available of [false, true]) {
     const f = fixture({action:'review'});
     let opened = 0;
@@ -161,9 +244,41 @@ test('unavailable automatic preflight never navigates and manual review remains 
     await assert.rejects(f.api.openAcceptance({id:'task-1'}, {acceptanceMode:'auto'}),
       available ? /Acceptance service unavailable/ : /无法读取验收条件/);
     assert.equal(opened, 0);
-    assert.equal(await f.api.openAcceptance({id:'task-1'}, {acceptanceMode:'manual'}), true);
-    assert.equal(opened, 1);
+    if(available){
+      await assert.rejects(f.api.openAcceptance({id:'task-1'},{acceptanceMode:'manual'}),/Acceptance service unavailable/);
+      assert.equal(opened,0,'A failed authoritative history read must not be presented as an empty history');
+    }else{
+      assert.equal(await f.api.openAcceptance({id:'task-1'}, {acceptanceMode:'manual'}), true);
+      assert.equal(opened, 1);
+    }
   }
+});
+
+for(const mode of ['manual','auto'])test(`${mode} review carries authoritative timeline and the captured approval note into conversation navigation`,async()=>{
+  const f=fixture({action:'review'}),calls=[];
+  const timeline={schemaVersion:1,revision:'revision',rows:[{id:'note',kind:'supplement',at:'2026-11-15T01:00:00Z',text:'Latest saved supplement'}]};
+  f.window.SoduWorkAPI.getAcceptanceContext=async()=>({artifactVersionId:'fixed-v1',criteria:[{id:'c1',label:'Frozen criterion'}],requirementTimeline:timeline});
+  f.window.openTaskConversation=async(...args)=>{calls.push(args);return true;};
+  assert.equal(await f.api.openAcceptance({id:'task-1'},{acceptanceMode:mode,acceptanceInstruction:'New reviewer instruction'}),true);
+  assert.equal(calls.length,1);assert.equal(calls[0][2].requirementTimeline,timeline);
+  assert.equal(calls[0][2].acceptanceInstruction,'New reviewer instruction');
+});
+
+for(const mode of ['1','auto'])test(`the actual acceptance action ${mode} captures its note before leaving the approval card`,async()=>{
+  const f=fixture({action:'review'}),calls=[];f.state.opts={taskId:'task-1'};
+  f.note.value='  Current approval note  ';
+  f.window.openTaskConversation=async(...args)=>{calls.push(args);return true;};
+  const button={disabled:false,isConnected:true,getAttribute:()=>mode,
+    closest:selector=>selector==='.tfd-inline-approval'?f.block:selector==='[data-tfd-acceptance-session]'?button:null};
+  f.click(button);await settle();await settle();
+  assert.equal(calls.length,1);assert.equal(calls[0][2].acceptanceInstruction,'Current approval note');
+});
+
+test('the review note stays outside the manual-only approval details so both review modes can edit it',()=>{
+  const f=fixture({action:'review'}),html=f.api.html([f.item],{variant:'task',taskId:'task-1'});
+  const note=html.indexOf('data-tfd-approval-note'),details=html.indexOf('data-tfd-open="inline-approval-form"');
+  assert.ok(note>0&&note<details);assert.match(html,/验收补充说明/);
+  assert.equal((html.match(/data-tfd-approval-note/g)||[]).length,1,'Analysis and decisions share one explicit note, not duplicated inputs');
 });
 
 test('同一执行人与验收人优先复用原执行会话，原会话缺失时由导航层回退新会话', async () => {
@@ -228,7 +343,7 @@ test('验收卡选择的过程文件随同一验收会话传递，需求详情�
   assert.equal(calls[0][2].acceptanceSession, true);
 });
 
-test('重复点击验收入口只打开一个会话，失败后仍可重试', async () => {
+test('identical review choices share the pending and recent open, then refresh after the dedupe interval', async () => {
   const f = fixture({action: 'review'}), calls = [];
   let finish;
   f.window.openTaskConversation = (...args) => {
@@ -237,16 +352,108 @@ test('重复点击验收入口只打开一个会话，失败后仍可重试', as
   };
   const task = {id: 'task-dedupe', title: '交付结果'};
   const first = f.api.openAcceptance(task, {acceptanceMode: 'auto', approvalId: 'gate-1'});
-  const second = f.api.openAcceptance(task, {acceptanceMode: 'manual', approvalId: 'gate-1'});
+  const second = f.api.openAcceptance(task, {acceptanceMode: 'auto', approvalId: 'gate-1'});
   assert.strictEqual(first, second);
   await settle();
   assert.equal(calls.length, 1);
   finish(true);
   assert.equal(await first, true);
+  assert.strictEqual(f.api.openAcceptance(task, {acceptanceMode:'auto',approvalId:'gate-1'}),first);
+  assert.equal(calls.length,1);
   await new Promise(resolve => setTimeout(resolve, 2100));
   f.window.openTaskConversation = async (...args) => { calls.push(args); return true; };
   assert.equal(await f.api.openAcceptance(task, {acceptanceMode: 'auto', approvalId: 'gate-1'}), true);
   assert.equal(calls.length, 2);
+});
+
+const changedReviewChoices=[
+  ['mode',{acceptanceMode:'auto'}],
+  ['note',{acceptanceInstruction:'A newly entered reviewer note'}],
+  ['attachments',{acceptanceAttachmentIds:['process-b']}],
+];
+const reviewChoices=()=>({approvalId:'gate-1',acceptanceMode:'manual',acceptanceInstruction:'Original reviewer note',acceptanceAttachmentIds:['process-a']});
+
+for(const [name,change] of changedReviewChoices){
+  test(`a completed review open does not swallow a changed ${name} in the recent cache`,async()=>{
+    const f=fixture({action:'review'}),calls=[],task={id:'review-recent-'+name};
+    f.window.openTaskConversation=async(...args)=>{calls.push(args);return true;};
+    const original=reviewChoices(),updated={...original,...change};
+    assert.equal(await f.api.openAcceptance(task,original),true);
+    assert.equal(await f.api.openAcceptance(task,updated),true);
+    assert.equal(calls.length,2);
+    assert.equal(calls[1][2].acceptanceMode,updated.acceptanceMode);
+    assert.equal(calls[1][2].acceptanceInstruction,updated.acceptanceInstruction);
+    assert.deepEqual([...calls[1][2].acceptanceAttachmentIds],updated.acceptanceAttachmentIds);
+    assert.equal(calls[1][2].forceNew,false,'Changed choices reactivate the original review conversation');
+    assert.equal(await f.api.openAcceptance(task,updated),true);assert.equal(calls.length,2);
+  });
+
+  test(`a pending review serializes a changed ${name} and coalesces its duplicate without losing the new choice`,async()=>{
+    const f=fixture({action:'review'}),calls=[],done=[],task={id:'review-pending-'+name};
+    f.window.openTaskConversation=(...args)=>{calls.push(args);return new Promise(resolve=>done.push(resolve));};
+    const original=reviewChoices(),updated={...original,...change};
+    const first=f.api.openAcceptance(task,original),second=f.api.openAcceptance(task,updated);
+    assert.notStrictEqual(first,second);assert.strictEqual(f.api.openAcceptance(task,updated),second);
+    await settle();assert.equal(calls.length,1,'Only one navigation transaction may be active');
+    done[0](true);assert.equal(await first,true);await settle();assert.equal(calls.length,2);
+    assert.equal(calls[1][2].acceptanceMode,updated.acceptanceMode);
+    assert.equal(calls[1][2].acceptanceInstruction,updated.acceptanceInstruction);
+    assert.deepEqual([...calls[1][2].acceptanceAttachmentIds],updated.acceptanceAttachmentIds);
+    assert.equal(calls[1][2].forceNew,false);
+    done[1](true);assert.equal(await second,true);assert.equal(calls.length,2);
+  });
+}
+
+test('a queued choice cannot be bypassed by an earlier recent payload and the final activation preserves user order',async()=>{
+  const f=fixture({action:'review'}),calls=[],done=[],task={id:'ordered-review'};
+  f.window.openTaskConversation=(...args)=>{calls.push(args);return new Promise(resolve=>done.push(resolve));};
+  const original=reviewChoices(),first=f.api.openAcceptance(task,original);
+  const second=f.api.openAcceptance(task,{...original,acceptanceInstruction:'Second choice'});
+  await settle();done[0](true);assert.equal(await first,true);await settle();
+  const third=f.api.openAcceptance(task,original);
+  assert.notStrictEqual(third,first,'An old successful choice cannot bypass the newer pending activation');
+  await settle();assert.equal(calls.length,2);
+  done[1](true);assert.equal(await second,true);await settle();assert.equal(calls.length,3);
+  assert.equal(calls[2][2].acceptanceInstruction,'Original reviewer note');
+  done[2](true);assert.equal(await third,true);
+});
+
+test('a failed earlier open does not discard a queued new intent and identical failure remains retryable',async()=>{
+  const f=fixture({action:'review'}),calls=[],done=[],task={id:'retry-queued-review'};
+  f.window.openTaskConversation=(...args)=>{calls.push(args);return new Promise(resolve=>done.push(resolve));};
+  const original=reviewChoices(),first=f.api.openAcceptance(task,original);
+  const failure=assert.rejects(first,/验收会话未能打开/);
+  const second=f.api.openAcceptance(task,{...original,acceptanceInstruction:'Retry with this note'});
+  await settle();done[0](false);await failure;await settle();assert.equal(calls.length,2);
+  done[1](true);assert.equal(await second,true);
+  assert.equal(calls[1][2].acceptanceInstruction,'Retry with this note');
+  f.window.openTaskConversation=async(...args)=>{calls.push(args);return true;};
+  assert.equal(await f.api.openAcceptance(task,original),true);assert.equal(calls.length,3);
+});
+
+test('an account change rejects both the active and queued old review choices before any queued navigation',async()=>{
+  const f=fixture({action:'review'}),calls=[],task={id:'old-scope-review'};let finish;
+  f.window.openTaskConversation=(...args)=>{calls.push(args);return new Promise(resolve=>{finish=resolve;});};
+  const first=f.api.openAcceptance(task,reviewChoices());
+  const second=f.api.openAcceptance(task,{...reviewChoices(),acceptanceInstruction:'Queued old-account note'});
+  const failures=[assert.rejects(first,/账号或服务已变化/),assert.rejects(second,/账号或服务已变化/)];
+  await settle();assert.equal(calls.length,1);f.events['soduwork-data-scope-changed']();finish(true);
+  await Promise.all(failures);assert.equal(calls.length,1);
+  f.window.openTaskConversation=async(...args)=>{calls.push(args);return true;};
+  assert.equal(await f.api.openAcceptance(task,{...reviewChoices(),acceptanceInstruction:'New-account note'}),true);
+  assert.equal(calls.length,2);assert.equal(calls[1][2].acceptanceInstruction,'New-account note');
+});
+
+test('review choices capture attachment IDs before asynchronous context loading and dedupe equivalent file sets',async()=>{
+  const f=fixture({action:'review'}),calls=[],task={id:'captured-files-review'};let resolveContext;
+  f.window.SoduWorkAPI.getAcceptanceContext=()=>new Promise(resolve=>{resolveContext=resolve;});
+  f.window.openTaskConversation=async(...args)=>{calls.push(args);return true;};
+  const options={...reviewChoices(),acceptanceAttachmentIds:['process-a','process-b']};
+  const first=f.api.openAcceptance(task,options);
+  assert.strictEqual(f.api.openAcceptance(task,{...options,acceptanceAttachmentIds:['process-b','process-a','process-a']}),first);
+  options.acceptanceAttachmentIds.push('late-file');
+  resolveContext({artifactVersionId:'v',criteria:[{id:'c',label:'Works'}]});assert.equal(await first,true);
+  assert.deepEqual([...calls[0][2].acceptanceAttachmentIds],['process-a','process-b']);
 });
 
 test('待验收入口仅向实际验收人开放，不受执行设备归属限制', () => {

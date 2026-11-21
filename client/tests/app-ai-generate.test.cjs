@@ -42,6 +42,49 @@ test('contract rejects context, tool, message arrays and out-of-bounds inputs; m
   assert.equal(JSON.parse(f.calls[2][2].body).max_tokens, 1024);
   assert.equal(normalize(defaults).timeoutMs, 30000);
 });
+test('ordinary app calls keep their small budgets even for a large local reasoning model', async () => {
+  const model = { id: 'local:model-' + 'a'.repeat(32), wireModelId: 'private-reasoner',
+    localOnly: true, baseUrl: 'https://private.fixture.invalid/v1', maxOutputTokens: 16384,
+    thinkingMode: 'always', thinkingFormat: 'openai' };
+  const f = fixture({ resolveModel: async () => ({ ok: true, model }) });
+  await f.generate(f.item, { ...defaults, model: model.id });
+  await f.generate(f.item, { ...defaults, model: model.id, requestId: 'explicit-budget', maxOutputTokens: 2048 });
+  assert.deepEqual(f.calls.filter(row => row[0] === 'post').map(row => JSON.parse(row[2].body).max_completion_tokens), [256, 2048]);
+  await assert.rejects(f.generate(f.item, { ...defaults, model: model.id, maxOutputTokens: 16384 }));
+  await assert.rejects(f.generate(f.item, { ...defaults, model: model.id, useModelOutputLimit: true }));
+  const managed = fixture({ useModelOutputLimit: true });
+  await managed.generate(managed.item, defaults);
+  assert.equal(JSON.parse(managed.calls.find(row => row[0] === 'post')[2].body).max_tokens, 256);
+});
+
+test('model-default budgets and explicit app defaults cannot share a request receipt', async () => {
+  const model = { id: 'local:model-' + 'a'.repeat(32), wireModelId: 'private-budget-model',
+    localOnly: true, baseUrl: 'https://private.fixture.invalid/v1', maxOutputTokens: 16384 };
+  const f = fixture({ useModelOutputLimit: true, resolveModel: async () => ({ ok: true, model }) });
+  const params = { ...defaults, model: model.id };
+  assert.equal((await f.generate(f.item, params)).ok, true);
+  assert.equal((await f.generate(f.item, { ...params, maxOutputTokens: 256 })).code, 'APP_AI_REQUEST_CONFLICT');
+  assert.equal((await f.generate(f.item, { ...params, maxOutputTokens: null })).ok, true);
+  const posts = f.calls.filter(row => row[0] === 'post');
+  assert.equal(posts.length, 1);
+  assert.equal(JSON.parse(posts[0][2].body).max_tokens, 16384);
+});
+
+test('empty length-limited reasoning responses report the limit without leaking private reasoning', async () => {
+  for (const content of ['', null]) {
+    const f = fixture({ fetchImpl: async () => Response.json({ choices: [{
+      message: { content, reasoning_content: 'private provider reasoning' }, finish_reason: 'length' }] }) });
+    const result = await f.generate(f.item, defaults);
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'APP_AI_EMPTY_RESULT');
+    assert.equal(result.finishReason, 'length');
+    assert.equal(result.text, undefined);
+    assert.doesNotMatch(JSON.stringify(result), /private provider reasoning/);
+  }
+  const f = fixture({ fetchImpl: async () => Response.json({ choices: [{ message: { content: '' }, finish_reason: 'stop' }] }) });
+  assert.equal((await f.generate(f.item, defaults)).code, 'APP_AI_EMPTY_RESULT');
+});
+
 test('parallel repeats of the same request ID are charged once and conflicts are rejected', async () => {
   const f = fixture();
   const [a, b] = await Promise.all([f.generate(f.item, defaults), f.generate(f.item, defaults)]);
@@ -170,6 +213,25 @@ test('fast inference uses authorized thinking profiles and modern reasoning outp
   assert.equal(openai.max_completion_tokens, 256); assert.equal(openai.max_tokens, undefined);
   assert.equal(openai.reasoning_effort, 'none');
   assert.equal(payload({ id: 'gpt-5', thinkingAlwaysOn: true }, p).reasoning_effort, undefined);
+});
+
+test('stateless generation honors detected token parameter compatibility over model-name heuristics', () => {
+  const {payload} = require('../main/app-ai-generate.cjs'), p = normalize(defaults);
+  const modern = payload({id:'private-alias',reasoning:false,compatibility:{maxTokensField:'max_completion_tokens'}},p);
+  assert.equal(modern.max_completion_tokens,256); assert.equal(modern.max_tokens,undefined);
+  const legacy = payload({id:'gpt-5',compatibility:{maxTokensField:'max_tokens'}},p);
+  assert.equal(legacy.max_tokens,256); assert.equal(legacy.max_completion_tokens,undefined);
+});
+
+test('provider rejection keeps only a safe HTTP status and never automatically retries', async () => {
+  for (const status of [400,401,403,404,422,429,503]) {
+    let calls=0;
+    const f=fixture({fetchImpl:async()=>{calls++;return new Response('private-ticket endpoint details', {status});}});
+    const result=await f.generate(f.item,defaults);
+    assert.equal(result.httpStatus,status); assert.equal(result.ok,false);
+    assert.equal(result.code,status===429?'APP_AI_RATE_LIMITED':'APP_AI_PROVIDER_ERROR');
+    assert.equal(calls,1); assert.doesNotMatch(JSON.stringify(result),/private-ticket|endpoint details/);
+  }
 });
 
 test('omitted app models use authenticated scoped Pi defaults and successful receipts never cross devices or Hubs', async t => {

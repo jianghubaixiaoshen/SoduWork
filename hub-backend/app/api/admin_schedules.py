@@ -25,7 +25,21 @@ async def list_automation_templates(
 ):
     """Return administrator-maintained automation templates without user devices or credentials."""
     from ..services import automation_templates
-    return {"items": await automation_templates.load(session)}
+    from ..services import template_catalog_revision
+    # Read the raw catalog first so the version and items share one snapshot.
+    raw = await template_catalog_revision.read(session, automation_templates.SETTING_KEY)
+    import json
+    try:
+        values = json.loads(raw) if raw else []
+    except (ValueError, TypeError):
+        values = []
+    items = []
+    for value in (values if isinstance(values, list) else [])[:automation_templates.MAX_ITEMS]:
+        try:
+            items.append(automation_templates.normalize(value, require_name=False))
+        except ValueError:
+            continue
+    return {"items": items, "revision": template_catalog_revision.revision(raw)}
 
 
 @template_router.put("/automation-templates")
@@ -35,14 +49,21 @@ async def save_automation_templates(
     session: AsyncSession = Depends(get_session),
 ):
     from ..services import automation_templates
+    from ..services import template_catalog_revision
+    if not isinstance(body.get("revision"), str) or not body["revision"]:
+        raise HTTPException(status_code=428, detail="Reload the template catalog before saving; a revision is required.")
     try:
-        items = await automation_templates.save(session, body.get("items", []))
+        items = await automation_templates.save(session, body.get("items", []), expected_revision=body["revision"])
+    except template_catalog_revision.CatalogConflict as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await session.commit()
     await audit.log(session, user, "automation.templates.update", "setting",
                     automation_templates.SETTING_KEY, "自动化模板", {"count": len(items)})
-    return {"items": items}
+    import json
+    return {"items": items, "revision": template_catalog_revision.revision(json.dumps(items, ensure_ascii=False, separators=(",", ":")))}
 
 
 async def _scoped_ai_schedule(session: AsyncSession, sid: str, user: User, *, lock: bool = False):
@@ -171,6 +192,8 @@ async def run_ai_schedule(sid: str, user: User = Depends(require_perm("task.disp
     from ..models import AiSchedule
     from ..services import schedules as sch
     s = await _scoped_ai_schedule(session, sid, user)
+    if not s.enabled:
+        raise HTTPException(status_code=400, detail="任务已停用，无法运行")
     out = await sch.execute_one(
         session, s, trigger="manual",
         who=(user.display_name or user.username or "管理员"))

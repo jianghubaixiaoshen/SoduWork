@@ -13,11 +13,16 @@ function install({ app, ipcMain, session, identityOf, memories, cloud, publish }
     require('../conversation/requirement-context').identityMatches(handle, identity);
     return handle;
   }
-  ipcMain.handle('pi-session-select-agent', async (event, ref, agentId) => {
+  ipcMain.handle('pi-session-select-agent', async (event, ref, agentId, rawSelection) => {
     try {
       const handle = await current(event, ref);
-      const result = cloud.guard(handle) ? await cloud.selectExecution(handle, { agentId })
-        : await handle.selectAgent(String(agentId || ''), { identity: await identityOf(app),
+      const selection = typeof rawSelection?.modelName === 'string' ? { modelName: rawSelection.modelName } : {};
+      const remote = cloud.guard(handle);
+      const name = selection.modelName?.trim() || '';
+      if (remote && (name.startsWith('local:') || require('../../core/model-choice').imageChoice(name)?.name.trim().startsWith('local:')))
+        throw Error('云端暂不支持本地模型，请选择云端可用模型');
+      const result = remote ? await cloud.selectExecution(handle, { agentId, ...selection })
+        : await handle.selectAgent(String(agentId || ''), { ...selection, identity: await identityOf(app),
           validate: async () => {
             if (await current(event, ref) !== handle || cloud.guard(handle)) throw Error('会话归属已变化，请重新打开');
           } });

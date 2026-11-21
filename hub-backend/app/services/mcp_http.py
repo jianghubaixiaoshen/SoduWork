@@ -113,7 +113,12 @@ def _headers(spec: dict) -> dict[str, str]:
     return out
 
 
-def _response_chunks(response, deadline: float):
+class ResponseTooLarge(ValueError):
+    pass
+
+
+def _response_chunks(response, deadline: float, *, max_bytes: int = _MAX_RESPONSE_BYTES,
+                     idle_timeout: float | None = None):
     """Bound total time and bytes, including peers that send endless keepalives."""
     total = 0
     reader = getattr(response, "read1", response.read)
@@ -124,13 +129,13 @@ def _response_chunks(response, deadline: float):
         # urllib's timeout is otherwise an idle timeout, reset by every byte.
         sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
         if sock is not None:
-            sock.settimeout(remaining)
-        chunk = reader(min(65536, _MAX_RESPONSE_BYTES + 1 - total))
+            sock.settimeout(remaining if idle_timeout is None else min(remaining, idle_timeout))
+        chunk = reader(min(65536, max_bytes + 1 - total))
         if not chunk:
             return
         total += len(chunk)
-        if total > _MAX_RESPONSE_BYTES:
-            raise ValueError("MCP 返回内容超过安全上限，请缩小查询范围或使用分页")
+        if total > max_bytes:
+            raise ResponseTooLarge("MCP 返回内容超过安全上限，请缩小查询范围或使用分页")
         yield chunk
 
 

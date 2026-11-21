@@ -3,6 +3,8 @@
 is explicit. Use a temporary database without starting services or accessing development data.
 """
 import asyncio
+import hashlib
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -202,6 +204,20 @@ async def main():
         storage_key = seed_task_children(session, "task-offline-1")
         await session.commit()
         before = await child_counts(session, "task-offline-1")
+        events = (await session.scalars(select(models.TaskEvent).where(
+            models.TaskEvent.task_id == "task-offline-1").order_by(models.TaskEvent.at, models.TaskEvent.id))).all()
+        check("Task evidence retains exactly two definition receipts, one start and the seeded event",
+              sorted(row.kind for row in events) ==
+              ["requirement.definition", "requirement.definition", "task.execution_started", "test"])
+        definitions = [row.detail for row in events if row.kind == "requirement.definition"]
+        expected_definitions = []
+        for version, title in ((1, "离线创建"), (2, "重放后更新")):
+            content = {"title": title, "note": "", "acceptanceCriteria": []}
+            expected_definitions.append({"schemaVersion": 1, "requirementVersion": version, "content": content,
+                "contentHash": hashlib.sha256(json.dumps(content, ensure_ascii=False,
+                    sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()})
+        check("Creation and PUT replay retain their exact public definition content and versions",
+              definitions == expected_definitions, definitions)
         blocked = None
         try:
             await task_service.delete_task(session, "client-a", "task-offline-1")
@@ -226,7 +242,7 @@ async def main():
         deleted = await task_service.delete_task(session, "client-a", "task-offline-1")
         after = await child_counts(session, "task-offline-1")
         expected_children = {key: 1 for key in before}
-        expected_children["events"] = 2  # The manual start also retained its execution audit event.
+        expected_children["events"] = 4  # Creation, replay, manual start and the seeded audit event are all retained.
         check("显式删除前证据挂件存在", before == expected_children, before)
         check("显式删除任务成功", deleted.get("ok") is True, deleted)
         check("显式删除级联清理挂件", all(value == 0 for value in after.values()), after)

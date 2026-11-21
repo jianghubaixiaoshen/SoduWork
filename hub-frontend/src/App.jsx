@@ -68,7 +68,7 @@ const NAV = localeMap(() => ([
   { id: 'work-catalog', label: '工作目录', sub: '职业画像、工作类型与默认交付标准', icon: 'sitemap', Comp: WorkCatalog, group: '组织治理', perm: 'work.catalog.manage' },
   { id: 'users', label: '用户管理', sub: '成员、部门与角色归属', icon: 'users', Comp: Users, group: '组织治理', perm: 'user.manage' },
   { id: 'roles', label: '角色权限', sub: '角色和最小权限策略', icon: 'shield', Comp: Roles, group: '组织治理', perm: 'role.manage' },
-  { id: 'account-security', label: '账户与安全', sub: '注册邮件、协议与个人数据处理', icon: 'shield', Comp: MailSettings, group: '组织治理', perm: 'identity.manage' },
+  { id: 'account-security', label: '邮件与协议设置', sub: '注册邮件、协议与个人数据处理', icon: 'shield', Comp: MailSettings, group: '组织治理', perm: 'identity.manage' },
   { id: 'legal-documents', label: '协议与隐私政策', sub: '协议草稿、多语言发布与历史记录', icon: 'file', Comp: LegalDocuments, group: '组织治理', superOnly: true },
   { id: 'identity', label: '身份接入', sub: '企业 OIDC、账号映射与登录安全', icon: 'lock', Comp: IdentityCenter, group: '组织治理', perm: 'identity.manage' },
   { id: 'audit', label: '审计日志', sub: '关键操作与责任追溯', icon: 'ticket', Comp: Audit, group: '组织治理', perm: 'audit.view' },
@@ -93,6 +93,10 @@ export default function App() {
   const [me, setMe] = useState(getUser())
   const [health, setHealth] = useState({ state: 'checking', version: '' })
   const healthRef = useRef(null)
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [navQuery, setNavQuery] = useState('')
+  const menuButton = useRef(null)
+  const mainContent = useRef(null)
   const [collapsedGroups, setCollapsedGroups] = useState({})
   const [profileOpen, setProfileOpen] = useState(false)
   const [scaleStep, setScaleStepState] = useState(readScaleStep)
@@ -234,6 +238,10 @@ export default function App() {
       value === '能力配置' ? 'group.capabilities' : value === '组织治理' ? 'group.org' : ''
     return key ? t(key, value) : value
   }
+  const accountRole = me?.isSuper ? tx("超级管理员") : tx("管理员")
+  const accountName = me?.displayName || me?.username || accountRole
+  const query = navQuery.trim().toLocaleLowerCase()
+  const matchingItems = visible.filter(item => navLabel(item).toLocaleLowerCase().includes(query))
   const logout = () => {
     const proceed = () => { setProfileOpen(false); setToken(''); setUser(''); setAuthed(false); setMe(null); setShowLogin(false) }
     if (canLeavePage(proceed)) proceed()
@@ -256,25 +264,52 @@ export default function App() {
 
   return (
     <div className="app" data-screen={cur && cur.id}>
-      <aside className="sidebar">
+      <a className="public-skip" href="#admin-main" onClick={event => {
+        event.preventDefault()
+        setMenuOpen(false)
+        mainContent.current?.focus()
+      }}>{tx('跳到主要内容')}</a>
+      <aside className="sidebar" onKeyDown={event => {
+        if (event.key === 'Escape' && menuOpen && !event.defaultPrevented) {
+          setMenuOpen(false)
+          menuButton.current?.focus()
+        }
+      }}>
         <div className="brand">
           <img src="/soduwork.png" alt="" className="logo-box" />
           <span className="brand-copy"><b>{t('brand.title')}</b><small>{tx("企业智能工作台")}</small></span>
           <span className="brand-edition">{tx("企业")}</span>
         </div>
-        <nav className="nav" aria-label={t('nav.aria')}>
-          {groups.map((g) => (
-            <section className="nav-group" key={g}>
-              <button type="button" className="nav-label" aria-expanded={collapsedGroups[g] !== true}
-                onClick={() => setCollapsedGroups((old) => ({ ...old, [g]: old[g] !== true }))}><span>{groupLabel(g)}</span></button>
-              {collapsedGroups[g] !== true && visible.filter((n) => n.group === g).map((n) => (
-                <button key={n.id} title={navLabel(n) + ' · ' + t('sub.' + n.id, n.sub)} aria-current={cur && n.id === cur.id ? 'page' : undefined}
-                  className={'nav-item' + (cur && n.id === cur.id ? ' active' : '')} onClick={() => navigate(n.id)}>
-                  <span className="ico"><Icon name={n.icon} /></span><span className="nav-copy">{navLabel(n)}</span>
-                </button>
-              ))}
+        <button className="btn admin-menu-toggle" type="button" ref={menuButton}
+          aria-controls="admin-nav" aria-expanded={menuOpen}
+          onClick={() => setMenuOpen(open => !open)}>{t('nav.menu')}</button>
+        <nav id="admin-nav" className={'nav' + (menuOpen ? ' is-open' : '')} aria-label={t('nav.aria')}>
+          <input type="search" className="f-in" value={navQuery} aria-label={t('nav.search')}
+            placeholder={t('nav.search')} onChange={event => setNavQuery(event.target.value)} />
+          {matchingItems.length === 0 && <p role="status">{t('nav.empty')}</p>}
+          {groups.map((g, index) => {
+            const items = matchingItems.filter(item => item.group === g)
+            if (!items.length) return null
+            const expanded = !!query || collapsedGroups[g] !== true
+            const id = 'admin-nav-group-' + index
+            return <section className="nav-group" key={g}>
+              <button type="button" className="nav-label" aria-expanded={expanded} aria-controls={id} disabled={!!query}
+                onClick={() => setCollapsedGroups(old => ({ ...old, [g]: old[g] !== true }))}>{groupLabel(g)}</button>
+              <div id={id} hidden={!expanded}>
+                {items.map(n => (
+                  <button key={n.id} title={navLabel(n) + ' · ' + t('sub.' + n.id, n.sub)} aria-current={cur && n.id === cur.id ? 'page' : undefined}
+                    className={'nav-item' + (cur && n.id === cur.id ? ' active' : '')} onClick={() => {
+                      navigate(n.id)
+                      setMenuOpen(false)
+                      setNavQuery('')
+                      if (menuOpen) menuButton.current?.focus()
+                    }}>
+                    <span className="ico"><Icon name={n.icon} /></span><span className="nav-copy">{navLabel(n)}</span>
+                  </button>
+                ))}
+              </div>
             </section>
-          ))}
+          })}
         </nav>
         <div className="side-foot-wrap" ref={profileRef}>
           {profileOpen && <div id="profile-settings" className="profile-menu" role="dialog" aria-label={t('account.settings')}
@@ -283,8 +318,8 @@ export default function App() {
                 event.stopPropagation(); setProfileOpen(false); profileTriggerRef.current?.focus()
               }
             }}>
-            <div className="profile-menu-head"><div className="avatar">{(me && me.displayName || me && me.username || '?').slice(0, 1)}</div>
-              <div><b>{(me && me.displayName) || (me && me.username) || '—'}</b><span>{me && me.isSuper ? tx("超级管理员") : tx("管理员")}</span></div></div>
+            <div className="profile-menu-head"><div className="avatar" aria-hidden="true">{accountName.slice(0, 1)}</div>
+              <div><b>{accountName}</b>{accountRole !== accountName && <span>{accountRole}</span>}</div></div>
             <div className="profile-menu-meta"><span>{tx("登录环境")}</span><b>{tx("企业内网")}</b></div>
             <div className="profile-menu-actions"><span>{tx("界面主题")}</span><ThemeToggle /></div>
             <div className="profile-menu-actions"><span>{tx("字体大小")}</span>
@@ -306,8 +341,8 @@ export default function App() {
           </div>}
           <button ref={profileTriggerRef} type="button" className="side-foot" aria-expanded={profileOpen}
             aria-label={t('account.settings')} aria-haspopup="dialog" aria-controls={profileOpen ? 'profile-settings' : undefined} onClick={() => setProfileOpen((open) => !open)}>
-            <span className="avatar">{(me && me.displayName || me && me.username || '?').slice(0, 1)}</span>
-            <span className="u"><b>{(me && me.displayName) || (me && me.username) || '—'}</b><span>{me && me.isSuper ? tx("超级管理员") : tx("管理员")}{tx(" · 内网")}</span></span>
+            <span className="avatar" aria-hidden="true">{accountName.slice(0, 1)}</span>
+            <span className="u"><b>{accountName}</b><span>{accountRole === accountName ? tx("企业内网") : accountRole + tx(" · 内网")}</span></span>
             <Icon name="settings" className="profile-trigger-icon" />
           </button>
         </div>
@@ -331,7 +366,7 @@ export default function App() {
             </div>
           </div>
         </header>
-        <div className="content"><Suspense fallback={<Loading />}>{cur ? <Comp me={me} /> : null}</Suspense></div>
+        <main className="content" id="admin-main" tabIndex={-1} ref={mainContent}><Suspense fallback={<Loading />}>{cur ? <Comp me={me} /> : null}</Suspense></main>
       </div>
       <ToastHost />
     </div>

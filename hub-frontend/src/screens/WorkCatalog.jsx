@@ -148,7 +148,7 @@ export default function WorkCatalog({ me }) {
         <div className="wc-intro-copy">
           <span className="wc-eyebrow">{tx("企业工作语言")}</span>
           <h2>{tx("让一句需求，稳定走到可验收的结果")}</h2>
-          <p>{tx("职业画像描述员工长期擅长什么；工作场景描述一类需求应该用哪些能力、流程和交付标准。它们都不等于权限，也不绑定 Pi、OpenCode、Claude Code 或 Codex。")}</p>
+          <p>{tx("职业画像描述员工长期擅长什么；工作场景描述一类需求应该用哪些能力、流程和交付标准。它们都不等于权限，也不绑定 Pi、OpenCode 或 Codex。")}</p>
         </div>
         <div className="wc-intro-metrics">
           <span><b>{professions.length}</b>{tx(" 个职业画像")}</span>

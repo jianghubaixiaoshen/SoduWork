@@ -21,10 +21,10 @@
     }));
   }
 
-  function acceptanceDraft(task, mode) {
+  function acceptanceDraft(task, mode, context = {}) {
     const item = task || {};
     const title = String(item.title || item.name || '当前需求').trim();
-    const note = String(item.note || item.description || item.goal || '').trim();
+    const note = String(item.requirementContent?.note ?? item.note ?? item.description ?? item.goal ?? '').trim();
     const rawCriteria = item.acceptanceCriteria || item.acceptance || item.criteria || item.completionCriteria || [];
     const criteria = Array.isArray(rawCriteria)
       ? rawCriteria.map(value => typeof value === 'string' ? value : value && (value.label || value.text || value.name)).filter(Boolean)
@@ -42,7 +42,13 @@
     const lines = [mode === 'auto' ? '【自动验收】' : '【验收分析】',
       '请核对本次交付成果与需求目标，按验收标准逐项给出可复核结论。',
       '需求：' + title];
-    if (note) lines.push('需求说明：' + note.slice(0, 900));
+    const timeline = context.requirementTimeline || item.requirementTimeline;
+    const history = global.RequirementReviewContext?.prompt(timeline);
+    if (history) lines.push(history);
+    else {
+      if (note) lines.push('需求说明：' + note);
+      lines.push('当前服务未提供完整的需求与修改时间记录，不能将缺失记录视作没有补充说明或退回意见。');
+    }
     if (criteria.length) lines.push('验收标准：\n' + criteria.slice(0, 20).map((value, index) => (index + 1) + '. ' + value).join('\n'));
     else lines.push('验收标准：请以需求中已保存的完成标准为准，缺少证据时明确指出。');
     lines.push('相关文件：' +
@@ -50,6 +56,8 @@
     lines.push(mode === 'auto'
       ? '请完成核验后按自动验收约定输出审核结果；不要重新执行原需求。'
       : '请先分析并输出验收建议；本轮不改变需求状态，最终由我确认。');
+    const instruction = String(context.acceptanceInstruction || '').trim();
+    if (instruction) lines.push('本次验收补充说明：\n' + instruction);
     return lines.join('\n\n');
   }
 
@@ -69,6 +77,8 @@
     };
     const batches = new Map();
     fileRows.forEach((file, index) => {
+      // Match native rework selection: ordinary material uploads cannot select a delivery batch.
+      if (roundOf(file) === 0 && batchOf(file) === 'legacy' && String(file.role || '') === 'input') return;
       const key = batchOf(file), old = batches.get(key) || {key, stamp: -1, index: -1, round: 0};
       old.stamp = Math.max(old.stamp, stampOf(file, index)); old.index = Math.max(old.index, index); old.round = Math.max(old.round, roundOf(file));
       batches.set(key, old);
@@ -100,13 +110,20 @@
     ].join('\n\n');
   }
 
-  function acceptanceResolution(task, trace) {
+  function acceptanceResolution(task, trace, approvalId = '') {
     const item = task || {};
     if (item.reviewedAt || item.reviewed_at) return true;
     const routing = item.workRouting || item.work_routing || {};
     if (routing.reworkPending || routing.rework_pending || item.reviewRejected || item.review_rejected) return true;
     const approvals = Array.isArray(trace?.approvals) ? trace.approvals : [];
     const reviews = approvals.filter(row => String(row?.action || '').toLowerCase() === 'review');
+    // A cached previous round is not evidence that this approval finished.
+    // When the current approval is absent, wait for its authoritative trace.
+    if (approvalId) {
+      const current = reviews.find(row => String(row.id || '') === String(approvalId));
+      return Boolean(current && ['approved', 'rejected', 'declined', 'cancelled', 'canceled', 'revoked']
+        .includes(String(current.status || '').toLowerCase()));
+    }
     const pending = reviews.some(row => String(row?.status || '').toLowerCase() === 'pending' && !row.myDecision);
     const resolved = reviews.some(row => ['approved', 'rejected', 'declined', 'cancelled', 'canceled']
       .includes(String(row?.status || '').toLowerCase()));
@@ -141,7 +158,7 @@
     const id = String(taskId || '').trim();
     const bound = String(opts.taskRef || ctx._activeCollabTaskId || '').trim();
     if (!id || !bound || id !== bound) return false;
-    if (!acceptanceResolution(task, trace)) return false;
+    if (!acceptanceResolution(task, trace, opts.approvalId)) return false;
     ctx._sessionOptions = { ...opts, acceptanceExecutionSession: false,
       acceptanceSession: false, acceptanceMode: 'manual', approvalId: '', acceptanceAttachmentIds: [] };
     return true;
@@ -336,19 +353,47 @@
 
   function _activateAcceptanceContext(opts, taskSnapshot, label) {
     if (!opts?.acceptanceSession && !opts?.acceptanceExecutionSession) return;
+    const taskId = String(opts.taskId || taskSnapshot?.id || ctx._sessionOptions.taskRef || '').trim();
+    const approvalId = String(opts.approvalId || ''), mode = opts.acceptanceMode === 'auto' ? 'auto' : 'manual';
+    const scope = JSON.stringify([taskId,approvalId,mode]);
+    let priorScope = [];
+    try { priorScope = JSON.parse(ctx._sessionOptions.acceptanceDraftScope || '[]'); } catch (_) { /* An unrelated draft has no reusable review template. */ }
+    const sameReview = priorScope[0] === taskId && priorScope[1] === approvalId;
+    const previousDraft = sameReview ? ctx._sessionOptions.acceptanceDraft || '' : '';
+    const previousInstruction = sameReview ? ctx._sessionOptions.acceptanceInstruction || '' : '';
+    const visibleInstruction = sameReview
+      ? ctx._sessionOptions.acceptanceVisibleInstruction ?? previousInstruction : '';
+    const instruction = String(opts.acceptanceInstruction || '').trim();
+    const draftInstruction = instruction || previousInstruction;
+    const draft = acceptanceDraft(taskSnapshot || ctx._collaborationTask || {title:label},mode,
+      {...opts,acceptanceInstruction:draftInstruction});
+    const input = ctx._mount()?.querySelector('#nchatInput');
+    const before = String(input?.value || '');
+    const replace = !before.trim() || previousDraft && before === previousDraft;
+    let value = replace ? draft : before;
+    if (!replace) {
+      // Keep the old baseline and its note paired while preserving user edits.
+      // A newly supplied note must be visible as an addition, never hidden metadata.
+      if (instruction && instruction !== visibleInstruction)
+        value += '\n\n本次验收补充说明：\n' + instruction;
+      if (sameReview && (ctx._sessionOptions.acceptanceMode || 'manual') !== mode)
+        value += '\n\n本次验收方式：' + (mode === 'auto' ? '自动验收' : '手动分析') + '。原草稿中的历史引用仍按原记录时间处理。';
+    }
     ctx._sessionOptions = { ...ctx._sessionOptions,
       acceptanceSession: opts.acceptanceSession === true,
       acceptanceExecutionSession: opts.acceptanceExecutionSession === true,
-      acceptanceMode: opts.acceptanceMode === 'auto' ? 'auto' : 'manual',
-      approvalId: String(opts.approvalId || ''),
+      acceptanceMode: mode,
+      approvalId,
+      acceptanceDraft: replace ? draft : previousDraft,
+      acceptanceInstruction: replace ? draftInstruction : previousDraft ? previousInstruction : instruction,
+      acceptanceVisibleInstruction: instruction || visibleInstruction,
+      acceptanceDraftScope: replace || !previousDraft ? scope : ctx._sessionOptions.acceptanceDraftScope,
       acceptanceAttachmentIds: (opts.acceptanceSession || opts.acceptanceExecutionSession) && Array.isArray(opts.acceptanceAttachmentIds)
         ? [...new Set(opts.acceptanceAttachmentIds.map(String))].slice(0, 60) : [],
-      taskRef: String(opts.taskId || taskSnapshot?.id || ctx._sessionOptions.taskRef || '').trim(),
+      taskRef: taskId,
       taskTitle: label || ctx._sessionOptions.taskTitle || '' };
-    const input = ctx._mount()?.querySelector('#nchatInput');
-    if (input && !String(input.value || '').trim()) {
-      input.value = acceptanceDraft(taskSnapshot || ctx._collaborationTask || {title: label},
-        opts.acceptanceMode === 'auto' ? 'auto' : 'manual');
+    if (input && value !== before) {
+      input.value = value;
       input.dispatchEvent(new Event('input', { bubbles: true }));
     }
   }
@@ -832,7 +877,7 @@
     }
     // A reserved or released archive can retain its id without a live handle.
     // Explicit new execution must clear it before _ensure falls back to that id.
-    if ((ctx._ref || (opts.forceNew && ctx._sessionId)) &&
+    if ((ctx._ref || (opts.forceNew && ctx._sessionId) || (ctx._sessionId && mappedChatId && mappedChatId !== String(ctx._sessionId))) &&
         (!ctx._sessionId || !mappedChatId || String(mappedChatId) !== String(ctx._sessionId))) ctx.reset();
     current = _viewGuard(true);
     // A task may already belong to this shared conversation. Its requested
@@ -984,11 +1029,7 @@
         } catch (_) { /* attachment names are an enhancement; send-time loading remains authoritative */ }
       }
       if (seq !== ctx._taskOpenSeq || !current()) return false;
-      const input = ctx._mount()?.querySelector('#nchatInput');
-      if (input && !input.value) {
-        input.value = acceptanceDraft(acceptanceTask, opts.acceptanceMode === 'auto' ? 'auto' : 'manual');
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-      }
+      _activateAcceptanceContext(opts,acceptanceTask,label);
     }
     const newReworkSession = opts.reworkSession === true && (opts.forceNew === true || recoverDeletedRework);
     if (newReworkSession) {

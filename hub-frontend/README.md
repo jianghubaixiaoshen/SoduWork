@@ -8,6 +8,16 @@ React + Vite application for Hub administration. Entry point: `src/main.jsx`; ro
 
 Manage organizations, accounts, clients, execution networks, models, capabilities, tasks, approvals, plugins, and release configuration. Hub enforces authorization; hiding a button is not an access check.
 
+The model catalog starts with a compact service/model and live-load summary. Expand the overview for configuration, hourly metrics and request distribution; service and concurrency actions stay available while it is collapsed. Enabled services stay ahead of disabled ones, with custom services first within each group. A newly created service is temporarily brought into view; reopening restores that stable group order.
+
+Service cards adapt from one to four columns according to the available content width. View opens model details in a dialog without resizing or rearranging the service grid. Add, discover and configure actions remain visible; enable/disable and deletion are in the More popover, with the existing deletion confirmation retained.
+
+## Automation template dates
+
+Templates default to **No date limits**. Clear this option to set a start date, an end date, or both. Dates are inclusive and use the template's time zone (Asia/Shanghai by default); the existing hourly, daily or weekly rhythm determines execution times within that range. Invalid dates and reversed ranges are rejected before saving.
+
+The desktop copies these defaults into a new automation, where the user can adjust them before creation. Updating a template does not change existing automations. After the end date, no further recurring occurrences or retries are scheduled; the final eligible occurrence retains the scheduler's existing one-poll grace period. Existing tasks and records are retained. Extend an automation's own date range to resume future runs; extend the template separately for future users. Templates remain available until explicitly disabled.
+
 ## Develop
 
 The simplest setup is to run `sh start.sh` at the repository root in one terminal, then start Vite in another.
@@ -41,3 +51,5 @@ npm run build
 ```
 
 The build generates `dist/`, served by Hub or the deployment environment. Do not commit generated output, dependencies, or private configuration. Browser checks have separate scripts under `tests/`; distinguish fixtures from actual service or provider acceptance.
+
+After building, run `node tests/run-model-catalog-layout-browser.cjs /absolute/evidence/directory` for the model catalog's four-language layout, disclosure, polling and reload-order checks. Install the client Electron dependency or set `SODUWORK_ADMIN_TEST_ELECTRON` to its executable. This uses synthetic local responses, not a real Hub or provider.

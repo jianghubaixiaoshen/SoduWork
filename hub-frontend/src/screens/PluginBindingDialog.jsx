@@ -2,6 +2,7 @@ import { translateText as tx, localeMap, useLocale } from '../i18n.js'
 import React, { useEffect, useState } from 'react'
 import { api } from '../api.js'
 import { Icon, Modal, toast, SelectMenu } from '../ui.jsx'
+import { declaredAccess } from './plugin-catalog-model.js'
 import { PluginBindingToolAccess } from './PluginBindingToolAccess.jsx'
 import { LoadIssue } from './PluginOverviewParts.jsx'
 import { Field, NoticeList } from './PluginDialogParts.jsx'
@@ -260,6 +261,7 @@ export function BindingForm({ plugin, binding, onClose, onSaved }) {
           {versions.map((item) => <option key={item.id} value={item.id}>v{item.version}</option>)}
         </SelectMenu></Field>
       </div>
+      <p>{declaredAccess(version)}</p>
     </section>
     {upgrade && <CompatibilityNotice data={upgrade} confirm={confirmBreaking}
       onConfirm={setConfirmBreaking} />}

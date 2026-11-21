@@ -53,7 +53,7 @@ function create({ app, session, identityOf, preview, history, accountHistory, re
       // projection. Only its verified native source can grant execution access.
       const item = await accountHistory.row(id);
       assertCurrent();
-      if (item?.deleted) throw Error('这个会话已经删除');
+      if (item?.deleted) throw Object.assign(Error('这个会话已经删除'), { code: 'ACCOUNT_CONVERSATION_DELETED' });
       row = await require('./account-native-source.cjs').resolve({ app, session, item, identity });
       assertCurrent();
     }

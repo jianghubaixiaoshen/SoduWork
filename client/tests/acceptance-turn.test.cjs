@@ -23,6 +23,72 @@ function fixture(t, overrides = {}) {
   return { context, calls, notices, runtime, request, cwd };
 }
 
+function reviewTimeline() {
+  return { schemaVersion: 1, revision: 'timeline-v1', executionContextIncluded: true, rows: [
+    { kind: 'requirement', at: null, text: 'Original target: 400 words.' },
+    { kind: 'supplement', at: '2026-11-15T01:00:00Z', text: 'Updated target: 200 words.' },
+    { kind: 'rework', at: '2026-11-15T02:00:00Z', text: 'Returned for revision: 300 words.' },
+    { kind: 'supplement', at: '2026-11-15T03:00:00Z', text: 'Latest target: 250 words.' },
+  ] };
+}
+
+for (const mode of ['manual', 'auto']) test(`${mode} review includes supplemental and rejection history without promoting the generated draft`, async t => {
+  const f = fixture(t, { requirementTimeline: reviewTimeline(), requirementTimelineRevision: 'timeline-v1' });
+  const draft = '【自动验收】\nOriginal target: 400 words.';
+  const turn = await prepare({ identity: {}, taskId: 't', instruction: draft,
+    requested: { acceptanceMode: mode, acceptanceDraft: draft, acceptanceInstruction: 'Check spelling.' },
+    runtime: f.runtime, request: f.request });
+  for (const text of ['Original target: 400', 'Updated target: 200', 'Returned for revision: 300', 'Latest target: 250']) {
+    assert.ok(turn.text.includes(text), text);
+    assert.ok(turn.displayText.includes(text), text);
+  }
+  assert.match(turn.text, /真实记录时间最新/);
+  assert.equal(turn.text.split('Original target: 400').length - 1, 1);
+  assert.match(turn.text, /本轮验收人新增说明.*\nCheck spelling/);
+  assert.match(turn.text, /保持原验收标准的 criterion 编号/);
+  await turn.beforeTurn();
+  if (mode === 'auto') {
+    fs.writeFileSync(turn.reportPath, JSON.stringify({ verdict: 'approve', summary: 'Checked the latest target',
+      checks: [{ criterion: 'c1', result: 'pass', evidence: 'Latest supplemental target from 03:00 is 250 words; counted 250.' }] }));
+    await turn.afterTurn('completed');
+    assert.equal(f.calls.find(c => c.body).body.requirementTimelineRevision, 'timeline-v1');
+    assert.doesNotMatch(JSON.stringify(f.calls.find(c => c.body).body), /local:model|apiKey|requirementTimeline":/);
+  }
+});
+
+test('queued and completed analysis reject changed supplemental history even when artifact and requirement versions stay unchanged', async t => {
+  const f = fixture(t, { requirementTimeline: reviewTimeline(), requirementTimelineRevision: 'timeline-v1' });
+  const turn = await prepare({ identity: {}, taskId: 't', runtime: f.runtime, request: f.request });
+  f.context.requirementTimeline.rows.push({ kind: 'rework', at: '2026-11-15T04:00:00Z', text: 'A later correction.' });
+  await assert.rejects(turn.beforeTurn(), /补充说明或退回意见/);
+  await assert.rejects(turn.afterTurn('completed', {}), /补充说明或退回意见/);
+  assert.equal(f.notices.length, 0);
+  assert.ok(f.calls.every(c => !c.body));
+});
+
+test('incomplete or mismatched history packets cannot silently fall back to the original requirement', async t => {
+  for (const timeline of [{ schemaVersion: 2, rows: [] }, { ...reviewTimeline(), revision: 'different' }]) {
+    const f = fixture(t, { requirementTimeline: timeline, requirementTimelineRevision: 'timeline-v1' });
+    await assert.rejects(prepare({ identity: {}, taskId: 't', runtime: f.runtime, request: f.request }), /格式或版本不完整/);
+    assert.ok(f.calls.every(c => !c.body));
+  }
+});
+
+test('prompt compaction preserves every supplemental record or rejects instead of dropping conflicting requirements', async t => {
+  const timeline = reviewTimeline();
+  timeline.rows[1].text = 'EARLY-SUPPLEMENT-' + 'x'.repeat(7000) + '-SUPPLEMENT-END';
+  const f = fixture(t, { requirementTimeline: timeline, requirementTimelineRevision: timeline.revision,
+    artifact: { manifest: 'Large delivery manifest '.repeat(4000) } });
+  const turn = await prepare({ identity: {}, taskId: 't', requested: { acceptanceMode: 'auto' },
+    runtime: f.runtime, request: f.request });
+  assert.ok(turn.text.includes(timeline.rows[1].text));
+  assert.ok(turn.text.includes('Latest target: 250 words.'));
+  assert.ok(turn.text.length <= 50000);
+  timeline.rows[1].text = 'x'.repeat(51000) + 'Latest critical sentence.';
+  await assert.rejects(prepare({ identity: {}, taskId: 't', runtime: f.runtime, request: f.request }), /超过.*限制/);
+  assert.ok(f.calls.every(c => !c.body));
+});
+
 test('人工分析使用验收提示与固定版本，完成后不提交决策或执行原需求', async t => {
   const f = fixture(t);
   const turn = await prepare({ identity: {}, taskId: 't', instruction: '检查文风',

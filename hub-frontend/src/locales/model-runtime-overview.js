@@ -1,5 +1,7 @@
 // Model catalog configuration, live load and request-history definitions.
 export default {
+  "展开概览": "Expand overview",
+  "收起概览": "Collapse overview",
   "目录配置": "Catalog configuration",
   "服务总数": "Total services",
   "已启用 {0} · 已停用 {1}": "Enabled {0} · Disabled {1}",
@@ -77,6 +79,8 @@ export default {
 }
 
 export const ja = {
+  "展开概览": "概要を展開",
+  "收起概览": "概要を折りたたむ",
   "目录配置": "カタログの設定",
   "服务总数": "サービス総数",
   "已启用 {0} · 已停用 {1}": "有効 {0} · 無効 {1}",
@@ -154,6 +158,8 @@ export const ja = {
 }
 
 export const ko = {
+  "展开概览": "개요 펼치기",
+  "收起概览": "개요 접기",
   "目录配置": "카탈로그 설정",
   "服务总数": "전체 서비스",
   "已启用 {0} · 已停用 {1}": "활성화 {0}개 · 비활성화 {1}개",

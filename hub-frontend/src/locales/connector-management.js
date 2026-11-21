@@ -44,6 +44,7 @@ export default {
   '可用于对话、插件和自动化': 'Available in conversations, plugins and automations',
   '点击连接将检查并启用此连接；检查不会发送或修改业务内容。': 'Connecting checks and enables this connection. The check does not send or change business content.',
   '此连接已被更新，当前填写内容已保留。关闭后重新打开可查看最新配置。': 'This connection has been updated. Your draft has been preserved. Close and reopen it to view the latest configuration.',
+  '此连接已被更新，但自动刷新失败。当前填写内容已保留，请稍后重试。': 'This connection has been updated, but automatic refresh failed. Your draft has been preserved. Please try again later.',
 }
 
 export const ja = {
@@ -94,6 +95,7 @@ export const ja = {
   '可用于对话、插件和自动化': '会話、プラグイン、自動化で利用できます',
   '点击连接将检查并启用此连接；检查不会发送或修改业务内容。': '接続すると、設定を確認して有効にします。確認時に業務コンテンツを送信、変更することはありません。',
   '此连接已被更新，当前填写内容已保留。关闭后重新打开可查看最新配置。': 'この接続は更新されています。入力内容は保持されています。最新の設定を確認するには、閉じてから開き直してください。',
+  '此连接已被更新，但自动刷新失败。当前填写内容已保留，请稍后重试。': 'この接続は更新されていますが、自動更新に失敗しました。入力内容は保持されています。しばらくしてから再試行してください。',
 }
 
 export const ko = {
@@ -144,4 +146,5 @@ export const ko = {
   '可用于对话、插件和自动化': '대화, 플러그인, 자동화에서 사용할 수 있습니다',
   '点击连接将检查并启用此连接；检查不会发送或修改业务内容。': '연결을 누르면 설정을 확인하고 사용하도록 설정합니다. 확인 중에는 업무 콘텐츠를 보내거나 변경하지 않습니다.',
   '此连接已被更新，当前填写内容已保留。关闭后重新打开可查看最新配置。': '이 연결이 업데이트되었습니다. 입력한 내용은 유지됩니다. 최신 설정을 보려면 닫았다가 다시 여세요.',
+  '此连接已被更新，但自动刷新失败。当前填写内容已保留，请稍后重试。': '이 연결이 업데이트되었지만 자동 새로고침에 실패했습니다. 입력한 내용은 유지됩니다. 잠시 후 다시 시도하세요.',
 }

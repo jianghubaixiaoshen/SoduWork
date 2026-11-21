@@ -17,6 +17,7 @@ _KNOWN = (
     (re.compile(r"(?:^|[-_:/.])(?:gpt-4\.1|o[134](?:-mini)?)(?:$|[-_:/.])", re.I), 1_048_576),
     (re.compile(r"(?:^|[-_:/.])(?:claude|sonnet|opus|haiku)(?:$|[-_:/.])", re.I), 200_000),
     (re.compile(r"(?:^|[-_:/.])gemini-(?:1\.5|2(?:\.0|\.5)?)(?:$|[-_:/.])", re.I), 1_048_576),
+    (re.compile(r"(?:^|[:/])deepseek-(?:flash|v4-pro)(?:$|\s)", re.I), 1_048_576),
     (re.compile(r"(?:^|[-_:/.])deepseek(?:$|[-_:/.])", re.I), 64_000),
     (re.compile(r"(?:^|[-_:/.])(?:qwen|通义千问)(?:$|[-_:/.])", re.I), 131_072),
     (re.compile(r"(?:^|[-_:/.])(?:glm|chatglm)(?:$|[-_:/.])", re.I), 128_000),
@@ -59,9 +60,10 @@ def _explicit(value: dict) -> int:
 
 def _infer(value: dict) -> int:
     row = value if isinstance(value, dict) else {}
-    model = row.get("model") if isinstance(row.get("model"), dict) else {}
+    raw_model = row.get("model")
+    model = raw_model if isinstance(raw_model, dict) else {}
     name = str(row.get("modelName") or row.get("id") or model.get("id") or
-               model.get("name") or "").strip()
+               model.get("name") or (raw_model if isinstance(raw_model, str) else "")).strip()
     provider = str(row.get("provider") or row.get("providerId") or
                    model.get("provider") or model.get("providerId") or "").strip()
     suffix = re.search(r"(?:^|[-_./])(\d+(?:\.\d+)?)\s*(k|m|b)(?:$|[-_./])", name, re.I)

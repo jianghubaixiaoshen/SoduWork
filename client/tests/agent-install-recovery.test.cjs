@@ -27,8 +27,6 @@ test('incomplete installations offer repair on both card and details, including 
   assert.equal(f._agState(absent), 'missing');
   assert.match(f._agBodyHtml(absent, 'missing'), /data-ainstall="dsh"/);
   assert.doesNotMatch(f._agRowHtml(absent), /data-arepair=/);
-  assert.equal(f._agState({ ...broken, key: 'harness2', bundled: true,
-    warnNow: 'Google Harness² 需要 OpenCode 执行组件，请点「装上」自动准备。' }), 'setup');
   const ready = { ...broken, installed: true, state: 'ready' };
   assert.equal(f._agState(ready), 'ready');
   assert.match(f._agRowHtml(ready), /data-aprobe="dsh"/);
