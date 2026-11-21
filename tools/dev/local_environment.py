@@ -18,6 +18,7 @@ import re
 import tempfile
 import time
 
+from . import intel_macos_build
 from .local_path_check import check_windows_source_paths
 
 
@@ -190,12 +191,16 @@ def check_desktop_session() -> None:
                            "or use start.py without --desktop for a headless service.")
 
 
-def dependency_report(*, desktop: bool = False) -> None:
+def dependency_report(*, desktop: bool = False, state: Path | None = None) -> None:
     """Read-only prerequisite check; never initialize an instance or install software."""
     _, npm, version = _probe_dependencies()
     print(f"Python: {platform.python_version()} ({sys.executable})")
     print(f"Node.js: {version}")
     print(f"npm: {npm}\nPlatform: {platform.system()} {platform.machine()}")
+    python = state / "venv/bin/python" if state else None
+    pin, gaps = intel_macos_build.requirements_for(python, ROOT / "hub-backend/requirements.txt", os.environ, read_only=True)
+    if gaps:
+        raise StartupError(intel_macos_build.instructions(pin, gaps))
     if desktop:
         check_desktop_session()
         print("Desktop: Electron will be installed in this instance's private application directory.")
@@ -216,8 +221,11 @@ def checkout_files() -> set[Path] | None:
         output = subprocess.check_output([git, "-C", str(ROOT), "ls-files", "-co",
                                           "--exclude-standard", "-z"], timeout=20,
                                          stderr=subprocess.DEVNULL, **spawn_options())
-    except subprocess.SubprocessError as exc:
-        raise StartupError("Cannot inspect source checkout files. Check Git access or use a clean source archive.") from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        reason = "Cannot inspect source checkout files. Check Git access or use a clean source archive."
+        if sys.platform == "darwin" and not intel_macos_build.output(["xcrun", "--find", "git"], os.environ):
+            reason += " 找不到 Xcode 命令行工具 / Install Xcode Command Line Tools with xcode-select --install."
+        raise StartupError(reason) from exc
     return {ROOT / item.decode("utf-8") for item in output.split(b"\0") if item}
 
 
@@ -403,7 +411,8 @@ def prepare(state: Path, log: Path) -> tuple[Path, Path]:
     requirements = [ROOT / "hub-backend" / name for name in ("requirements.txt", "requirements-runner.txt")]
     py_stamp = state / "python-dependencies.sha256"
     wanted = digest_files(requirements, ROOT)
-    install = read_stamp(py_stamp) != wanted
+    pin, gaps = intel_macos_build.requirements_for(python, requirements[0], python_env)
+    install = bool(pin) or read_stamp(py_stamp) != wanted
     if not install:
         try:
             verify_runner_environment(python, backend, log, env=python_env)
@@ -414,6 +423,19 @@ def prepare(state: Path, log: Path) -> tuple[Path, Path]:
             # launcher's environment, never a checkout or activated shell venv.
             install = True
     if install:
+        if gaps:
+            # A local wheelhouse or private index can supply a matching wheel
+            # without any compiler. Never fall back to an implicit Rust download.
+            guidance = intel_macos_build.instructions(pin, gaps)
+            print(guidance, flush=True)
+            try:
+                run([str(python), "-I", "-m", "pip", "install", "--disable-pip-version-check",
+                     "--only-binary=:all:", "--no-deps", pin], cwd=state, log=log, env=python_env,
+                    label="[Intel macOS] 查找预编译 wheel / Checking for a compatible wheel")
+            except DiskFullError:
+                raise
+            except StartupError as exc:
+                raise StartupError(f"{guidance}\n{exc}") from exc
         run([str(python), "-I", "-m", "pip", "install", "--disable-pip-version-check",
              *[argument for file in requirements for argument in ("-r", str(file))]], cwd=state, log=log,
             env=python_env,
