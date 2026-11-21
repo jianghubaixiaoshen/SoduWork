@@ -1516,7 +1516,11 @@ class LocalStartupTests(unittest.TestCase):
             "node": "echo v22.23.3", "npm": "echo 10.9.7",
             "rustc": 'if [ "$1" = --version ]; then echo "rustc ${TEST_RUST}"; else echo "$TEST_LIBS"; fi',
             "cargo": 'echo "cargo 1.83.0"',
-            "xcrun": 'case "$1" in --find|--show-sdk-path) echo "$TEST_LIBS";; lipo) echo "$TEST_LIB_ARCH";; esac',
+            "cross-cc": 'test "$1" = "-isysroot" && test "$2" = "$TEST_LIBS" || exit 1\n'
+                        'test "$TEST_CC_ARCH" = x86_64 || exit 1\n'
+                        'grep -q "TargetConditionals.h" && echo SODUWORK_INTEL_SDK',
+            "xcrun": 'if [ "$TEST_XCRUN" = broken ] && [ "$1" != lipo ]; then exit 1; fi\n'
+                     'case "$1" in --find|--show-sdk-path) echo "$TEST_LIBS";; lipo) echo "$TEST_LIB_ARCH";; esac',
         }
         for name, script in scripts.items():
             path = tools / name
@@ -1525,7 +1529,8 @@ class LocalStartupTests(unittest.TestCase):
         env = {**os.environ, "PATH": str(tools) + ":" + os.defpath, "TEST_PYTHON": sys.executable,
                "TEST_DRIVER": str(driver), "FIXTURE_ARCH": "x86_64", "TEST_RUST": "1.83.0",
                "TEST_LIBS": str(tools), "TEST_LIB_ARCH": "x86_64", "OPENSSL_DIR": str(prefix)}
-        for key in ("CARGO", "RUSTC", "OPENSSL_STATIC", "OPENSSL_LIB_DIR", "OPENSSL_INCLUDE_DIR"):
+        for key in ("CARGO", "RUSTC", "OPENSSL_STATIC", "OPENSSL_LIB_DIR", "OPENSSL_INCLUDE_DIR", "CC",
+                    "SDKROOT", "ARCHFLAGS", "PIP_FIND_LINKS", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_NO_INDEX"):
             env.pop(key, None)
         command = ["/bin/sh", "start.sh", "--check", "--data-dir", str(self.state)]
 
@@ -1540,6 +1545,15 @@ class LocalStartupTests(unittest.TestCase):
             result = check(**changes)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(missing, result.stderr)
+        cross = {"CC": str(tools / "cross-cc"), "SDKROOT": str(tools), "TEST_XCRUN": "broken"}
+        self.assertEqual(check(**cross, TEST_CC_ARCH="x86_64").returncode, 0)
+        self.assertIn("Clang + macOS SDK", check(**cross, TEST_CC_ARCH="arm64").stderr)
+        self.assertIn("Clang + macOS SDK", check(TEST_XCRUN="broken").stderr)
+        pending = check(TEST_XCRUN="broken", PIP_FIND_LINKS=str(tools / "private-wheelhouse"))
+        self.assertEqual(pending.returncode, 0)
+        self.assertIn("pip will verify", pending.stdout)
+        self.assertNotIn("Prerequisites are ready", pending.stdout)
+        self.assertNotIn("private-wheelhouse", pending.stdout)
         header.write_text("#define OPENSSL_VERSION_NUMBER 0x1010107fL\n")
         self.assertIn("OpenSSL", check().stderr)
         self.assertEqual(check(FIXTURE_ARCH="arm64", TEST_RUST="0.0.0").returncode, 0)
@@ -1575,6 +1589,29 @@ class LocalStartupTests(unittest.TestCase):
         with patch.object(sys, "platform", "darwin"), patch.object(intel, "output", side_effect=binary_type), \
                 patch.object(intel, "build_gaps", side_effect=AssertionError("unneeded compiler probe")):
             self.assertEqual(intel.requirements_for(python, requirements, {}, read_only=True), ("", []))
+
+    def test_intel_library_inspection_falls_back_only_to_system_tools(self):
+        intel = build.intel_macos_build
+        lib = self.state / "libcrypto.dylib"
+        commands = []
+        def inspect(command, env):
+            commands.append(command)
+            return "x86_64 arm64" if command[:3] == ["/usr/bin/arch", "-arm64", "/usr/bin/xcrun"] else ""
+        with patch.object(intel, "output", side_effect=inspect):
+            self.assertIn("x86_64", intel.library_arches(lib, {}))
+            self.assertEqual(commands, [
+                ["xcrun", "lipo", "-archs", str(lib)], ["/usr/bin/lipo", "-archs", str(lib)],
+                ["/usr/bin/arch", "-arm64", "/usr/bin/xcrun", "lipo", "-archs", str(lib)]])
+        with patch.object(intel, "output", return_value="arm64") as probe:
+            self.assertEqual(intel.library_arches(lib, {}), ["arm64"])
+            probe.assert_called_once()
+
+    def test_only_explicit_alternate_pip_sources_defer_wheel_verification(self):
+        check = build.intel_macos_build.explicit_wheel_source
+        self.assertFalse(check({"PIP_INDEX_URL": "https://pypi.org/simple"}))
+        self.assertFalse(check({"PIP_INDEX_URL": "https://mirror.example/simple", "PIP_NO_INDEX": "true"}))
+        self.assertTrue(check({"PIP_EXTRA_INDEX_URL": "https://mirror.example/simple"}))
+        self.assertTrue(check({"PIP_NO_INDEX": "1", "PIP_FIND_LINKS": "local-wheelhouse"}))
 
     def test_macos_checkout_failure_identifies_missing_command_line_tools(self):
         with patch.object(sys, "platform", "darwin"), patch.object(build.shutil, "which", return_value="git"), \

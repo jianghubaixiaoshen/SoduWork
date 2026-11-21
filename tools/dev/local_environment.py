@@ -200,11 +200,18 @@ def dependency_report(*, desktop: bool = False, state: Path | None = None) -> No
     python = state / "venv/bin/python" if state else None
     pin, gaps = intel_macos_build.requirements_for(python, ROOT / "hub-backend/requirements.txt", os.environ, read_only=True)
     if gaps:
-        raise StartupError(intel_macos_build.instructions(pin, gaps))
+        guidance = intel_macos_build.instructions(pin, gaps)
+        if not intel_macos_build.explicit_wheel_source(os.environ):
+            raise StartupError(guidance)
+        print(guidance)
     if desktop:
         check_desktop_session()
         print("Desktop: Electron will be installed in this instance's private application directory.")
-    print("Prerequisites are ready. First-time setup needs internet access; no files were changed.")
+    if gaps:
+        print(f"已配置 pip 软件源，兼容 wheel 待安装时核验 / pip will verify availability and compatibility "
+              f"of {pin} from the configured source during setup. This check did not access it or change files.")
+    else:
+        print("Prerequisites are ready. First-time setup needs internet access; no files were changed.")
 
 
 @lru_cache(maxsize=1)

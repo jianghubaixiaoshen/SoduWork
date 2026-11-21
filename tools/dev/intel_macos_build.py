@@ -4,18 +4,68 @@ from __future__ import annotations
 import os
 import platform
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
-def output(command: list[str], env: dict) -> str:
+def output(command: list[str], env: dict, *, source: str | None = None) -> str:
     try:
-        result = subprocess.run(command, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        result = subprocess.run(command, env=env, input=source, stdin=subprocess.DEVNULL if source is None else None,
+                                stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, errors="replace", timeout=8)
         return result.stdout.strip() if result.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
         return ""
+
+
+def library_arches(library: Path, env: dict) -> list[str]:
+    args = ["-archs", str(library)]
+    # Some Apple Silicon installations only ship the arm64 developer tools.
+    # The native fallback only reads the given Mach-O file's slice table.
+    for tool in (["xcrun", "lipo"], ["/usr/bin/lipo"], ["/usr/bin/arch", "-arm64", "/usr/bin/xcrun", "lipo"]):
+        arches = output([*tool, *args], env).split()
+        if arches:
+            return arches
+    return []
+
+
+def compiler_ready(env: dict) -> bool:
+    cc = env.get("CC_x86_64-apple-darwin") or env.get("CC_x86_64_apple_darwin") or env.get("CC")
+    if not cc and not env.get("SDKROOT"):
+        return bool(output(["xcrun", "--find", "clang"], env) and output(["xcrun", "--show-sdk-path"], env))
+    # Check the explicitly selected compiler and SDK together. An arm64-only
+    # default configuration must not satisfy the Intel Python build check.
+    source = ("#include <stdlib.h>\n#include <TargetConditionals.h>\n"
+              "#if !defined(__x86_64__) || !TARGET_OS_OSX\n#error wrong target\n#endif\nSODUWORK_INTEL_SDK\n")
+    try:
+        compiler = [cc] if cc and Path(cc).is_file() else shlex.split(cc or "cc")
+        flags = shlex.split(env.get("ARCHFLAGS", ""))
+    except ValueError:
+        return False
+    if not compiler:
+        return False
+    sdk = ["-isysroot", env["SDKROOT"]] if env.get("SDKROOT") else []
+    return output([*compiler, *flags, *sdk, "-E", "-P", "-x", "c", "-o", "-", "-"], env,
+                  source=source).endswith("SODUWORK_INTEL_SDK")
+
+
+def explicit_wheel_source(env: dict) -> bool:
+    if env.get("PIP_FIND_LINKS", "").strip():
+        return True
+    if env.get("PIP_NO_INDEX", "").lower() not in ("", "0", "false", "no", "off"):
+        return False
+    for spec in (env.get("PIP_INDEX_URL", ""), env.get("PIP_EXTRA_INDEX_URL", "")):
+        for value in spec.split():
+            try:
+                address = urlsplit(value)
+                if address.scheme == "file" or (address.hostname and address.hostname not in {"pypi.org", "pypi.python.org"}):
+                    return True
+            except ValueError:
+                continue
+    return False
 
 
 def openssl_development_files(env: dict) -> bool:
@@ -46,7 +96,7 @@ def openssl_development_files(env: dict) -> bool:
             continue
         for suffix in ((".a",) if env.get("OPENSSL_STATIC") == "1" else (".dylib", ".a")):
             pair = [libraries / (name + suffix) for name in ("libssl", "libcrypto")]
-            if all(lib.is_file() and "x86_64" in output(["xcrun", "lipo", "-archs", str(lib)], env).split()
+            if all(lib.is_file() and "x86_64" in library_arches(lib, env)
                    for lib in pair):
                 return True
     return False
@@ -67,7 +117,7 @@ def build_gaps(env: dict) -> list[str]:
             missing.append("Rust x86_64-apple-darwin target")
     if not re.match(r"^cargo \d+\.\d+\.\d+\b", output([cargo, "--version"], probes)):
         missing.append("Cargo")
-    if not output(["xcrun", "--find", "clang"], env) or not output(["xcrun", "--show-sdk-path"], env):
+    if not compiler_ready(env):
         missing.append("Xcode Command Line Tools (Clang + macOS SDK)")
     if not openssl_development_files(env):
         missing.append("OpenSSL development headers and libraries (openssl@3)")
