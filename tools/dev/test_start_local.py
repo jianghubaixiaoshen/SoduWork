@@ -1449,6 +1449,8 @@ class LocalStartupTests(unittest.TestCase):
             cache_env = build.prepare_environment(state)
             build.prepare(state, state / 'startup.log')
         installs = run.call_args_list
+        self.assertEqual([call.args[0] for call in installs if call.kwargs.get("diagnose_pip_build")],
+                         [call.args[0] for call in installs if "pip" in call.args[0]])
         self.assertEqual(len(installs), 5)  # venv, pip, Runner probe, npm ci, build
         self.assertTrue(any('pip' in call.args[0] for call in installs))
         for call in installs:
@@ -1606,6 +1608,12 @@ class LocalStartupTests(unittest.TestCase):
             self.assertEqual(intel.library_arches(lib, {}), ["arm64"])
             probe.assert_called_once()
 
+    def test_arm_launcher_checks_default_compiler_as_the_intel_pip_child(self):
+        intel = build.intel_macos_build
+        with patch.object(intel.platform, "machine", return_value="arm64"), patch.object(intel, "output", return_value="") as probe:
+            self.assertFalse(intel.compiler_ready({}))
+            probe.assert_called_once_with(["/usr/bin/arch", "-x86_64", "/usr/bin/xcrun", "--find", "clang"], {})
+
     def test_only_explicit_alternate_pip_sources_defer_wheel_verification(self):
         check = build.intel_macos_build.explicit_wheel_source
         self.assertFalse(check({"PIP_INDEX_URL": "https://pypi.org/simple"}))
@@ -1624,6 +1632,27 @@ class LocalStartupTests(unittest.TestCase):
             self.addCleanup(build.checkout_files.cache_clear)
             with self.assertRaisesRegex(build.StartupError, "xcode-select --install"):
                 build.checkout_files()
+
+    def test_intel_pip_compiler_diagnostic_uses_only_current_native_build_evidence(self):
+        log = Path(self.temp.name) / "pip.log"
+        native_error = b"Check for working C compiler: /usr/bin/cc - broken\nERROR: Failed building wheel for a package\n"
+        log.write_bytes(native_error)
+        offset = log.stat().st_size
+        with patch.object(sys, "platform", "darwin"), patch.object(build.intel_macos_build, "output", return_value="x86_64"), \
+                patch.object(build.intel_macos_build, "compiler_ready", return_value=False):
+            for unrelated in (b"TLS certificate verify failed", b"No matching distribution found for fastapi"):
+                log.write_bytes(native_error + unrelated)
+                error = build.command_failure("pip failed", log, offset, pip_python="python", env={})
+                self.assertNotIn("xcode-select", str(error))
+            log.write_bytes(native_error + native_error)
+            self.assertIn("SDKROOT", str(build.command_failure("pip failed", log, offset, pip_python="python", env={})))
+            self.assertNotIn("SDKROOT", str(build.command_failure("npm failed", log, offset)))
+            log.write_bytes(native_error + native_error + b"No space left on device")
+            self.assertIsInstance(build.command_failure("pip failed", log, offset, pip_python="python", env={}), build.DiskFullError)
+        log.write_bytes(native_error)
+        with patch.object(sys, "platform", "darwin"), patch.object(build.intel_macos_build, "output", return_value="x86_64"), \
+                patch.object(build.intel_macos_build, "compiler_ready", return_value=True):
+            self.assertNotIn("xcode-select", str(build.command_failure("pip failed", log, 0, pip_python="python", env={})))
 
     def test_intel_missing_toolchain_tries_only_the_pinned_wheel_before_other_packages(self):
         self.state.mkdir()

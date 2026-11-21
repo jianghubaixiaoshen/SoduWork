@@ -43,9 +43,12 @@ class DiskFullError(StartupError):
     """A storage failure that must not be replaced with download advice."""
 
 
-def command_failure(message: str, log: Path, offset: int) -> StartupError:
+def command_failure(message: str, log: Path, offset: int, *, pip_python: str | None = None,
+                    env: dict | None = None) -> StartupError:
     """Classify only this attempt, without echoing potentially private output."""
     prefix = f"{message}. See {log}. "
+    intel_pip = pip_python is not None and sys.platform == "darwin"
+    compiler_failure = False
     try:
         with log.open('rb') as output:
             output.seek(offset)
@@ -57,9 +60,22 @@ def command_failure(message: str, log: Path, offset: int) -> StartupError:
                     return DiskFullError(prefix + '磁盘空间不足 / Disk full. '
                                          'Free space on the data, cache or temporary-directory volume '
                                          'and retry; completed steps are reused.')
-                tail = text[-128:]
+                if intel_pip and re.search(rb"Check for working C compiler:[^\r\n]{1,512} - broken|"
+                                           rb"No CMAKE_C_COMPILER could be found|C compiler cannot create executables",
+                                           text, re.I):
+                    compiler_failure = True
+                tail = text[-600:]
     except OSError:
         pass  # Preserve the command failure even if its log cannot be read.
+    if compiler_failure:
+        install_env = env if env is not None else os.environ
+        arch = intel_macos_build.output([pip_python, "-I", "-B", "-c", "import platform; print(platform.machine())"], install_env)
+        if arch.lower() in {"x86_64", "amd64"} and not intel_macos_build.compiler_ready(install_env):
+            return StartupError(prefix + "其他 Python 依赖需要可用的 Intel C 编译器和 macOS SDK。"
+                                "请安装适配系统的 Xcode 命令行工具（xcode-select --install），或配置可编译 x86_64 的 CC 和 SDKROOT 后重试。 "
+                                "A source dependency could not compile for Intel macOS. Install compatible Xcode "
+                                "Command Line Tools, configure CC and SDKROOT for x86_64, or supply compatible wheels "
+                                "for the remaining source dependencies.")
     return StartupError(prefix + 'Check the failing step in the log for the cause and retry; '
                         'completed steps are reused.')
 
@@ -111,7 +127,7 @@ def wait_child(child: subprocess.Popen, *, progress_label: str | None = None,
 
 
 def run(command: list[str], *, cwd: Path, log: Path, label: str,
-        env: dict | None = None, timeout: float | None = None) -> None:
+        env: dict | None = None, timeout: float | None = None, diagnose_pip_build: bool = False) -> None:
     print(label, flush=True)
     started = time.monotonic()
     with log.open("ab") as output:
@@ -129,7 +145,8 @@ def run(command: list[str], *, cwd: Path, log: Path, label: str,
                 stop_child(child)
                 raise
     if code:
-        raise command_failure(f"{label} failed (exit {code})", log, offset)
+        raise command_failure(f"{label} failed (exit {code})", log, offset,
+                              pip_python=command[0] if diagnose_pip_build else None, env=env)
     print(f"  完成 / Done ({time.monotonic() - started:.1f}s)", flush=True)
 
 
@@ -445,7 +462,7 @@ def prepare(state: Path, log: Path) -> tuple[Path, Path]:
                 raise StartupError(f"{guidance}\n{exc}") from exc
         run([str(python), "-I", "-m", "pip", "install", "--disable-pip-version-check",
              *[argument for file in requirements for argument in ("-r", str(file))]], cwd=state, log=log,
-            env=python_env,
+            env=python_env, diagnose_pip_build=True,
             label="[2/4] 安装服务依赖 / Installing server dependencies (first run needs internet)")
         verify_runner_environment(python, backend, log, env=python_env)
         py_stamp.write_text(wanted, encoding="utf-8")

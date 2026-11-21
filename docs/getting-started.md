@@ -35,7 +35,7 @@ Windows 桌面启动还会在本实例的应用副本中准备并校验命令运
 
 通过 `xcode-select --install` 安装 Xcode 命令行工具，并准备包含 Cargo、rustc 1.83.0 或更高版本的 Rust 工具链，以及 Intel 兼容的 OpenSSL 开发头文件和库。使用 Intel Homebrew 时可运行 `brew install rust openssl@3`。若 OpenSSL 安装在自定义位置，将 `OPENSSL_DIR` 指向安装前缀。若 rustup 的主机架构不同，用 `rustup target add x86_64-apple-darwin` 安装目标标准库。请选用适配当前 macOS 版本的工具。通过 `CC` 和 `SDKROOT` 显式配置的交叉编译器及 SDK，须能以 Intel macOS 为目标预处理系统头文件。
 
-执行 `sh start.sh --check --data-dir /path/to/your-instance` 可检查目标 Python 及工具链，检查过程不会安装软件。如果组织提供可信的匹配 wheel，可通过 `PIP_FIND_LINKS` 指向相应的 wheel 目录或配置私有 pip 软件源，再正常启动。只读检查会提示此路径待核验，安装时由 pip 确认 wheel 是否兼容。缺少编译工具时，启动器先查找固定版本的预编译包，再安装其余依赖。
+执行 `sh start.sh --check --data-dir /path/to/your-instance` 可检查目标 Python 及工具链，检查过程不会安装软件。如果组织提供可信的匹配 wheel，可通过 `PIP_FIND_LINKS` 指向相应的 wheel 目录或配置私有 pip 软件源，再正常启动。这个 wheel 可替代 `cryptography` 本身的 Rust 和 OpenSSL 编译。若软件源未提供 `argon2-cffi-bindings` 等其他依赖的兼容 wheel，安装这些依赖仍可能需要能编译 Intel 目标的 Clang 和 macOS SDK。只读检查会提示此路径待核验，安装时由 pip 确认 wheel 是否兼容。缺少编译工具时，启动器先查找固定版本的预编译包，再安装其余依赖。
 
 ## 怎么判断启动成功
 

@@ -35,7 +35,10 @@ def library_arches(library: Path, env: dict) -> list[str]:
 def compiler_ready(env: dict) -> bool:
     cc = env.get("CC_x86_64-apple-darwin") or env.get("CC_x86_64_apple_darwin") or env.get("CC")
     if not cc and not env.get("SDKROOT"):
-        return bool(output(["xcrun", "--find", "clang"], env) and output(["xcrun", "--show-sdk-path"], env))
+        # A native arm64 launcher can reuse an Intel venv. Query the default
+        # tools exactly as that instance's pip child would see them.
+        xcrun = ["/usr/bin/arch", "-x86_64", "/usr/bin/xcrun"] if platform.machine().lower() in {"arm64", "aarch64"} else ["xcrun"]
+        return bool(output([*xcrun, "--find", "clang"], env) and output([*xcrun, "--show-sdk-path"], env))
     # Check the explicitly selected compiler and SDK together. An arm64-only
     # default configuration must not satisfy the Intel Python build check.
     source = ("#include <stdlib.h>\n#include <TargetConditionals.h>\n"
